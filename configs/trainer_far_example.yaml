@@ -1,0 +1,98 @@
+# FAR训练器配置文件示例
+# 此文件中的配置会覆盖BaseConfig中的默认值
+# 优先级: 命令行参数 > YAML配置 > BaseConfig默认值
+
+# 基础配置
+run_name: "BioDynaSpec_Custom"
+base_dir: "./runs"
+seed: 42
+deterministic: true
+
+# 数据相关
+train_path: "./dataset/fft_window2500/atlas_10_features_fouriered_list_train_normalized.pth"
+val_path: "./dataset/fft_window2500/atlas_10_features_fouriered_list_val_normalized.pth"
+bihito_repr_dir: "./dataset/bihito_repr_cache/atlas"
+batch_size: 1
+num_workers: 32
+
+# 模型配置
+spectrum_token_dim: 1
+num_xyz_channels: 3
+use_complex_spectrum: true
+aatype_vocab_size: 21
+esm_dim: 1280
+num_sampling_steps: '50'
+diffusion_batch_mul: 1
+dropout_rate: 0.0
+denoise_seq_chunk_size: 2560
+denoise_block_type: "residue"  # "residue"=残基注意力, "mlp"=无残基注意力
+denoise_use_checkpoint: true
+use_checkpoint: true
+max_spectrum_len: 2560
+
+# Diffusion loss parameters
+learn_sigma: false
+predict_xstart: false
+sigma_small: false
+noise_schedule: 'cosine'
+use_kl: false
+rescale_learned_sigmas: false
+diffusion_steps: 1000
+
+# 训练相关
+max_epochs: 50
+lr: 0.0001
+warmup_epochs: 10
+min_lr: 0.000001
+warmup_start_lr: 0.0000001
+plateau_patience: 8
+plateau_factor: 0.7
+beta: 0.000001
+
+# Trainer配置
+using_ray: false
+devices: "auto"
+sync_batchnorm: true
+precision: 'bf16'
+gradient_clip_val: 1.0
+accumulate_grad_batches: 1
+log_every_n_steps: 1
+reload_dataloaders_every_n_epochs: 1
+num_sanity_val_steps: 0
+check_val_every_n_epoch: 1
+limit_val_batches: 1.0
+find_unused_parameters: true
+
+# 检查点相关
+save_top_k: 10
+monitor_metric: 'train_loss'
+monitor_mode: 'min'
+checkpoint_interval: 1
+
+# WandB配置
+use_wandb: true
+wandb_project: "BioMacroDynamicsFAR"
+wandb_id: null
+
+# 断点续训
+load_checkpoint_path: null
+load_weights_only: true
+load_state_strict: false
+
+# 按步保存ckpt（None=按epoch保存）
+save_every_n_steps: 1
+
+# 数据集子采样
+use_dataset_subsample: true
+subsample_ratio: 0.1
+
+# 超参数搜索相关（仅在Ray Tune模式下使用）
+# 这些参数可以通过Ray Tune的搜索空间进一步覆盖
+# encoder_depth: 4
+# encoder_num_heads: 8
+# decoder_embed_dim: 512
+# decoder_depth: 4
+# decoder_num_heads: 8
+# buffer_size: 32
+# diffloss_d: 2
+# diffloss_w: 512

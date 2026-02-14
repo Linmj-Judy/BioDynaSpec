@@ -1,0 +1,6 @@
+# ninja log v7
+15	10846	1768727465600005000	layer_norm_cuda.o	3e55dbd9fed9181c
+15	25740	1768727465600570000	layer_norm_cuda_kernel.cuda.o	b301a4572ca1397b
+25757	26043	1768727491342444000	fastfold_layer_norm_cuda.so	f06e9acef0a9b315
+20	317	1768727617450860000	fastfold_layer_norm_cuda.so	f06e9acef0a9b315
+22	309	1768755876329590000	fastfold_layer_norm_cuda.so	f06e9acef0a9b315
