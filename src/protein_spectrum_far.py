@@ -865,50 +865,73 @@ class ProteinSpectrumFAR(nn.Module):
         else:
             raise ValueError(f"Unsupported shape of spectrum_tokens: {spectrum_tokens}")
         return spectrum
-    
-    # TODO：模型同时预测出实部和虚部，但这里没有加上实部和虚部是反对称的这个硬约束条件，所以应该只预测出实部，然后再根据反共轭给出虚部
 
-    def progressive_masking(self, spectrum_tokens, num_residues, seq_len):
+    def progressive_masking(self, spectrum_positive):
         """
         Progressive masking strategy for spectrum generation
         Simulates progressive resolution increase (like in FAR)
         
         Args:
-            spectrum_tokens: (num_residues, seq_len, token_embed_dim)
+            spectrum_positive: (..., num_residues, seq_len, spectrum_dim)
         Returns:
-            masked_tokens: progressively masked spectrum
-            stage_index: current generation stage
+            masked_tokens: progressively masked spectrum (num_residues, seq_len, spectrum_dim)
+            stage_index: current generation stage (int)
         """
-        # B = spectrum_tokens.shape[0]
-        device = spectrum_tokens.device
-        
-        # Now assumes spectrum_tokens: (num_residues, seq_len, dim), no batch dimension
+        # B = spectrum_positive.shape[0]
+        device = spectrum_positive.device
+        num_residues = spectrum_positive.shape[-3]
+        seq_len = spectrum_positive.shape[-2]
+        batch_shape = spectrum_positive.shape[:-3]
+
+        # spectrum_positive: (...,num_residues, seq_len, dim), no batch dimension
 
         # Random stage from 0 to seq_len
         # Stage 0: all zeros (no frequency)
         # Stage seq_len: full spectrum
-        stage = torch.randint(0, seq_len + 1, (1,), device=device).item()
+        stage = torch.randint(0, seq_len + 1, (1,), device=device).item() # Python int
         
-        masked_tokens = torch.zeros_like(spectrum_tokens)
+        masked_spectrum = torch.zeros_like(spectrum_positive)
 
         if int(stage) > 0:
-            # Use interpolation to simulate progressive frequency addition
-            # Take first s frequency components and interpolate
-            partial_spectrum = spectrum_tokens[:, :stage, :]  # (num_residues, s, dim)
+            # 直接对 spectrum_positive 做二维插值（频率轴 + xyz 轴），避免多次 reshape
+            # 输入: spectrum_positive (..., num_residues, seq_len, spectrum_dim)
+            # 截取前 stage 个频率分量（在 seq_len 维度上）
+            partial_spectrum = spectrum_positive[..., :stage, :]  # (..., num_residues, stage, spectrum_dim)
             
-            # Interpolate to seq_len
-            # Reshape for interpolation: (num_residues, dim, s)
-            partial_spectrum = partial_spectrum.permute(0, 2, 1)  # (num_residues, dim, s)
-            partial_spectrum = partial_spectrum.reshape(num_residues * self.token_embed_dim, 1, stage)
-            
-            # Interpolate
-            interpolated = F.interpolate(partial_spectrum, size=seq_len, mode='linear', align_corners=False)
-            interpolated = interpolated.reshape(num_residues, self.token_embed_dim, seq_len)
-            interpolated = interpolated.permute(0, 2, 1)  # (num_residues, seq_len, dim)
-            
-            masked_tokens = interpolated
+            # 需要 F.interpolate 的输入为 (N, C, H, W)
+            # 这里 "C" 作为1，H: freq, W: xyz（或 dim）
+            # 先转为 (..., num_residues, 1, stage, spectrum_dim)
+            interp_input = partial_spectrum.unsqueeze(-3)  # (..., num_residues, 1, stage, spectrum_dim)
+            # 合并前面的 batch/num_residues: (N, 1, stage, spectrum_dim)
+            orig_shape = interp_input.shape
+            interp_input = interp_input.reshape(-1, 1, stage, self.spectrum_dim)
+            # 二维插值到 (seq_len, spectrum_dim)
+            interpolated = F.interpolate(
+                interp_input,
+                size=(seq_len, self.spectrum_dim),
+                mode='bilinear',
+                align_corners=False
+            )
+            # 还原维度 (..., num_residues, seq_len, spectrum_dim)
+            interpolated = interpolated.reshape(*orig_shape[:-3], seq_len, self.spectrum_dim)
+            interpolated = interpolated.squeeze(-3)
+            masked_spectrum = interpolated
+        
+        base_orders = torch.arange(seq_len, device=device, dtype=torch.long)
+        shifted_orders = (base_orders + stage) % seq_len
 
-        return masked_tokens, stage
+        # Calculate mask ratio based on stage (progressive reveal: stage↑ -> mask↓)
+        mask_ratio = 1.0 - float(stage) / max(seq_len, 1)
+        mask_ratio = np.clip(mask_ratio, 0.0, 1.0)
+
+        # Generate mask for spectrum (no batch)
+        mask = torch.zeros(*batch_shape, num_residues, seq_len, device=device)
+
+        N_masked = int(np.ceil(seq_len * mask_ratio))
+        mask_indices = shifted_orders[:N_masked]
+        mask[..., mask_indices] = 1.0
+
+        return masked_spectrum, mask.bool(), stage
     
     # def sample_orders(self, bsz, seq_len, device):
     #     """Generate random generation orders for each sample"""
@@ -1358,7 +1381,7 @@ class ProteinSpectrumFAR(nn.Module):
         if bihito_token_repr is not None:
             s_s = s_s + self.bihito_proj(bihito_token_repr)
 
-        system_condition = self.IPA_en、coder(s_s, s_z, coords, rotation_matrices, aa_mask.to(dtype=s_s.dtype)) # (num_residues, c_s)
+        system_condition = self.IPA_encoder(s_s, s_z, coords, rotation_matrices, aa_mask.to(dtype=s_s.dtype)) # (num_residues, c_s)
 
         # IRFC distance (residue pairwise squared distance)
         irfc_dist_sq = torch.sum(
@@ -1400,11 +1423,15 @@ class ProteinSpectrumFAR(nn.Module):
         # Original training mode: random stage sampling
         # Progressive masking
         masked_tokens, stage_index = self.progressive_masking(spectrum_tokens, num_residues, seq_len)
-        
+
+        # Progressive masking
+        # Note: spectrum_tokens should be spectrum_positive here
+        masked_tokens, mask, stage_index = self.progressive_masking(spectrum_tokens)
+
         # Random masking for autoregressive training
         device = s_s.device
-        orders = self.sample_orders(seq_len, device)
-        mask = self.random_masking(masked_tokens, orders, stage_index, seq_len) if self.mask else None
+        # orders = self.sample_orders(seq_len, device)
+        # mask = self.random_masking(masked_tokens, orders, stage_index, seq_len) if self.mask else None
         
         # Forward through encoder
         encoded = self.forward_encoder(masked_tokens, 
