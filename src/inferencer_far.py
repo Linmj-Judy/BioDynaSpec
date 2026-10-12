@@ -12,20 +12,15 @@ import numpy as np
 from collections import defaultdict
 from tqdm import tqdm
 from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import Optional, Dict, List
 import argparse
 import contextlib
 
-from data.dataset_atlas import ProteinMotionDataset
 from data.fourier.utils import (
     PreprocessStateStruct,
     TrajectoryFFTConfig,
     TrajectoryFFTProcessor,
-    irfft_full,
-    reconstruct_full_spectrum_from_positive_half,
     reconstruct_full_spectrum_from_positive_half_real_imag,
-    _window_vector,
 )
 from visualize.utils import plot_far_results
 from protein_spectrum_far import (
@@ -35,24 +30,6 @@ from protein_spectrum_far import (
     sample_multiple,
 )
 
-
-MAPSCALING_FACTOR_IDS = [
-    '5znj_A_R1', '6d7y_A_R1', '6d7y_B_R1', '6e7e_A_R1', '6gus_A_R1', '6h49_A_R1', 
-    '6h86_A_R1', '6iah_A_R1', '6in7_A_R1', '6j56_A_R1', '6jpt_A_R1', '6jv8_A_R1', 
-    '6jwh_A_R1', '6kty_A_R1', '6l34_A_R1', '6l3r_E_R1', '6l4l_A_R1', '6l4p_B_R1', 
-    '6l8s_A_R1', '6lrd_A_R1', '6lus_A_R1', '6ndw_B_R1', '6nl2_A_R1', '6o2v_A_R1', 
-    '6o6y_A_R1', '6odd_B_R1', '6okd_C_R1', '6ono_C_R1', '6ovk_R_R1', '6oz1_A_R1', 
-    '6p5h_A_R1', '6p5x_B_R1', '6pce_B_R1', '6pnv_A_R1', '6pxz_B_R1', '6q10_A_R1', 
-    '6q9c_A_R1', '6q9c_B_R1', '6qj0_A_R1', '6ro6_A_R1', '6rrv_A_R1', '6rwt_A_R1', 
-    '6sms_A_R1', '6tgk_C_R1', '6tly_A_R1', '6uof_A_R1', '6vjg_A_R1', '6xb3_H_R1', 
-    '6xds_A_R1', '6xrx_A_R1', '6y2x_A_R1', '6yhu_B_R1', '6ypi_A_R1', '6zsl_B_R1', 
-    '7a66_B_R1', '7aex_A_R1', '7aqx_A_R1', '7asg_A_R1', '7buy_A_R1', '7bwf_B_R1', 
-    '7c45_A_R1', '7dmn_A_R1', '7e2s_A_R1', '7ead_A_R1', '7ec1_A_R1', '7jfl_C_R1', 
-    '7jrq_A_R1', '7k7p_B_R1', '7la6_A_R1', '7lao_A_R1', '7lp1_A_R1', '7mf4_A_R1', 
-    '7n0j_E_R1', '7ned_A_R1', '7nmq_A_R1', '7onn_A_R1', '7p41_D_R1', '7p46_A_R1', 
-    '7qsu_A_R1', '7rm7_A_R1', '7s86_A_R1', '7wab_A_R1'
-]
-DEFAULT_HANN_PERIODIC = True
 
 def set_seed(seed: int):
     import random, numpy as np, torch
@@ -299,14 +276,12 @@ class FARInferencer:
 
     @staticmethod
     def _detect_data_mode(data_list: List[Dict], mode: str) -> str:
-        if mode in ("fft", "stft", "fft_window"):
+        if mode in ("fft", "fft_window"):
             return mode
         for item in data_list:
             positions = item.get("positions", {})
             if positions.get("x_fft_windows") is not None:
                 return "fft_window"
-            if positions.get("x_windows") is not None:
-                return "stft"
         return "fft"
 
     @staticmethod
@@ -317,30 +292,6 @@ class FARInferencer:
         spectrum_y_imag = [item[:, 1] for item in positions["y"]]
         spectrum_z_real = [item[:, 0] for item in positions["z"]]
         spectrum_z_imag = [item[:, 1] for item in positions["z"]]
-        spectrum = np.stack(
-            [
-                spectrum_x_real,
-                spectrum_x_imag,
-                spectrum_y_real,
-                spectrum_y_imag,
-                spectrum_z_real,
-                spectrum_z_imag,
-            ],
-            axis=-1,
-        )  # [N, F, 6]
-        return torch.tensor(spectrum, dtype=torch.float32).unsqueeze(-1)
-
-    @staticmethod
-    def _build_window_spectrum(positions: Dict, window_idx: int) -> torch.Tensor:
-        x_windows = positions["x_windows"][window_idx]
-        y_windows = positions["y_windows"][window_idx]
-        z_windows = positions["z_windows"][window_idx]
-        spectrum_x_real = [item[:, 0] for item in x_windows]
-        spectrum_x_imag = [item[:, 1] for item in x_windows]
-        spectrum_y_real = [item[:, 0] for item in y_windows]
-        spectrum_y_imag = [item[:, 1] for item in y_windows]
-        spectrum_z_real = [item[:, 0] for item in z_windows]
-        spectrum_z_imag = [item[:, 1] for item in z_windows]
         spectrum = np.stack(
             [
                 spectrum_x_real,
@@ -429,45 +380,6 @@ class FARInferencer:
         if pred.dim() == 5:
             pred = pred[0]
         return pred
-
-    def _reconstruct_window_coords(
-        self,
-        windows_spectrum: List[torch.Tensor],
-        frame0: torch.Tensor,
-        window_size: int,
-        total_frames: int,
-        hop_ratio: float = 0.5,
-        preprocess_state: Optional[Dict] = None,
-    ) -> torch.Tensor:
-        hop_size = int(window_size * hop_ratio)
-        window_vector = _window_vector(window_size, "hann", self.device, torch.float32)
-        
-        windows_spectrum =[
-            self._denormalize_spectrum(spectrum)
-            for spectrum in windows_spectrum
-        ] # n_window 个 (N, F, 6, 1)
-        windows_spectrum = torch.cat(windows_spectrum, dim=-1) # (N, F, 6, n_window)
-        spec_x = torch.complex(windows_spectrum[..., 0, :], windows_spectrum[..., 1, :]) # (N, F, n_window)
-        spec_y = torch.complex(windows_spectrum[..., 2, :], windows_spectrum[..., 3, :]) # (N, F, n_window)
-        spec_z = torch.complex(windows_spectrum[..., 4, :], windows_spectrum[..., 5, :]) # (N, F, n_window)
-        NT_hat_x = torch.istft(
-            spec_x, n_fft=window_size, hop_length=hop_size, win_length=window_size,
-            window=window_vector, center=False, length=total_frames, normalized=True, 
-        ) # (N, T)
-        NT_hat_y = torch.istft(
-            spec_y, n_fft=window_size, hop_length=hop_size, win_length=window_size,
-            window=window_vector, center=False, length=total_frames, normalized=True, 
-        ) # (N, T)
-        NT_hat_z = torch.istft(
-            spec_z, n_fft=window_size, hop_length=hop_size, win_length=window_size,
-            window=window_vector, center=False, length=total_frames, normalized=True, 
-        ) # (N, T)
-        # disp_x = irfft_full(spec_x, window_size, norm="ortho")
-        # disp_y = irfft_full(spec_y, window_size, norm="ortho")
-        # disp_z = irfft_full(spec_z, window_size, norm="ortho")
-        disp = torch.stack([NT_hat_x, NT_hat_y, NT_hat_z], dim=1)  # (N, 3, T)
-        coords = disp + frame0.unsqueeze(-1)
-        return self._invert_preprocessing_if_available(coords, preprocess_state)
 
     def _spectrum_to_full_fft_coords(
         self,
@@ -1671,117 +1583,7 @@ class FARInferencer:
             all_samples = None
             warn_gt_spectrum = None
 
-            if self.data_mode == "stft":
-                x_windows = positions.get("x_windows", [])
-                if not x_windows:
-                    logging.warning(f"{protein_id}: 未找到 x_windows，跳过")
-                    continue
-                window_size = int(positions.get("window_size"))
-                hop_ratio = float(positions.get("hop_ratio"))
-                num_windows = len(x_windows)
-                preprocess_states = positions.get("preprocess_state_windows")
-
-                rotation_matrices = (
-                    protein_data["rotation_matrices0"].clone().detach().to(self.device)
-                )
-                aatype_device = aatype.to(self.device)
-                aa_mask = torch.ones(
-                    aatype_device.shape, dtype=torch.bool, device=self.device
-                )
-                esm_features = torch.tensor(
-                    protein_data["esm"], device=self.device
-                )
-
-                predicted_windows = []
-                gt_windows = []
-                last_pred = None
-                first_frame_of_all = None
-
-                hop_size = int(window_size * hop_ratio)
-
-                for w in range(num_windows):
-                    frame0 = torch.tensor(
-                        np.stack(
-                            [
-                                positions["x0_windows"][w],
-                                positions["y0_windows"][w],
-                                positions["z0_windows"][w],
-                            ],
-                            axis=-1,
-                        ),
-                        dtype=torch.float32,
-                    ).to(self.device)
-                    if w == 0:
-                        first_frame_of_all = frame0
-                    spectrum = self._build_window_spectrum(positions, w).to(self.device)
-                    batch = (
-                        frame0,
-                        spectrum,
-                        rotation_matrices,
-                        aatype_device,
-                        aa_mask,
-                        esm_features,
-                        None,
-                        last_pred,
-                        window_size,
-                        hop_ratio,
-                    )
-                    if w == 0:
-                        pred_spectrum_window = spectrum
-                    else:
-                        pred_spectrum_window = self._predict_spectrum(batch)
-                    # 计算spectral_mse
-                    gt_spec_squeezed = spectrum.squeeze(-1) if spectrum.dim() > pred_spectrum_window.dim() else spectrum
-                    mse_loss = torch.nn.functional.mse_loss(pred_spectrum_window, gt_spec_squeezed)
-                    results["spectral_mse"].append(mse_loss.item())
-                    
-                    last_pred = pred_spectrum_window
-                    predicted_windows.append(pred_spectrum_window)
-                    gt_windows.append(spectrum)
-                    # 保存第一个窗口的pred_spectrum用于warn_if_static
-                    if w == 0:
-                        pred_spectrum = pred_spectrum_window
-                if num_windows > 0:
-                    warn_gt_spectrum = self._build_window_spectrum(positions, 0).to(self.device)
-                
-                sampling_end_time = time.time()
-                results["timing"]["far_sampling_times"].append(sampling_end_time - sampling_start_time)
-                
-                trajectory_start_time = time.time()
-
-                reconstructed_coords = self._reconstruct_window_coords(
-                    predicted_windows,
-                    first_frame_of_all,
-                    window_size,
-                    total_frames=num_windows * (window_size - hop_size),
-                    hop_ratio=hop_ratio,
-                    preprocess_state=(
-                        preprocess_states[0]
-                        if preprocess_states is not None and len(preprocess_states) > 0
-                        else None
-                    ),
-                )
-                gt_coords = self._reconstruct_window_coords(
-                    gt_windows,
-                    first_frame_of_all,
-                    window_size,
-                    total_frames=num_windows * (window_size - hop_size),
-                    hop_ratio=hop_ratio,
-                    preprocess_state=(
-                        preprocess_states[0]
-                        if preprocess_states is not None and len(preprocess_states) > 0
-                        else None
-                    ),
-                )
-                # 转换为 (T, N, 3) 格式用于指标计算
-                original_coords = gt_coords.permute(2, 0, 1).contiguous()
-                
-                trajectory_end_time = time.time()
-                results["timing"]["trajectory_reconstruction_times"].append(
-                    trajectory_end_time - trajectory_start_time
-                )
-
-            elif self.data_mode == "fft_window":
+            if self.data_mode == "fft_window":
                 x_windows = positions.get("x_fft_windows", [])
                 if not x_windows:
                     logging.warning(f"{protein_id}: 未找到 x_fft_windows，跳过")
@@ -1804,18 +1606,31 @@ class FARInferencer:
 
                 predicted_windows = []
                 gt_windows = []
+                # Recursive structural anchor (paper Sec. 3.3, Eq. 8):
+                #   x_start^(k+1) = X_hat^(k)_W
+                # Window 1 is seeded with the ground-truth initial conformation;
+                # every later window is conditioned on the LAST FRAME OF THE
+                # PREVIOUSLY GENERATED WINDOW, not on ground truth. This is what
+                # makes the rollout a genuine autoregressive rollout.
+                rollout_anchor = None
                 for w in range(num_windows):
-                    frame0 = torch.tensor(
-                        np.stack(
-                            [
-                                positions["x0_fft_windows"][w],
-                                positions["y0_fft_windows"][w],
-                                positions["z0_fft_windows"][w],
-                            ],
-                            axis=-1,
-                        ),
-                        dtype=torch.float32,
-                    ).to(self.device)
+                    if rollout_anchor is None:
+                        # first window: ground-truth anchor (aligned frame 0)
+                        frame0 = torch.tensor(
+                            np.stack(
+                                [
+                                    positions["x0_fft_windows"][w],
+                                    positions["y0_fft_windows"][w],
+                                    positions["z0_fft_windows"][w],
+                                ],
+                                axis=-1,
+                            ),
+                            dtype=torch.float32,
+                        ).to(self.device)
+                    else:
+                        # subsequent windows: generated anchor from window w-1
+                        frame0 = rollout_anchor
+
                     spectrum = self._build_fft_window_spectrum(positions, w).to(self.device)
                     pred_spectrum_window = self._predict_spectrum(
                         (
@@ -1832,7 +1647,22 @@ class FARInferencer:
                     gt_spec_squeezed = spectrum.squeeze(-1) if spectrum.dim() > pred_spectrum_window.dim() else spectrum
                     mse_loss = torch.nn.functional.mse_loss(pred_spectrum_window, gt_spec_squeezed)
                     results["spectral_mse"].append(mse_loss.item())
-                    
+
+                    # Decode this window and take its last frame as the next anchor.
+                    window_coords_w = self._spectrum_to_full_fft_coords(
+                        pred_spectrum_window,
+                        frame0,
+                        window_size,
+                        num_frames=self.config.num_frames,
+                        preprocess_state=(
+                            preprocess_states[w]
+                            if preprocess_states is not None and w < len(preprocess_states)
+                            else None
+                        ),
+                        skip_invert_preprocessing=True,
+                    )  # (N, 3, window_size)
+                    rollout_anchor = window_coords_w[..., -1].detach()  # (N, 3)
+
                     predicted_windows.append((pred_spectrum_window, frame0))
                     gt_windows.append((spectrum, frame0))
                     # 保存第一个窗口的pred_spectrum用于warn_if_static
@@ -2152,7 +1982,7 @@ class Config:
     checkpoint_path: str
     data_path: str
     output_dir: str
-    data_mode: str = "auto"  # auto/fft/stft
+    data_mode: str = "auto"  # auto/fft/fft_window
 
     # 运行配置
     device: str = "cuda"           
@@ -2183,8 +2013,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data_path", type=str, required=True, help="Input data path")
     parser.add_argument("--window_size", type=int, default=2500, help="Window size")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save inference outputs")
-    parser.add_argument("--data_mode", type=str, default="auto", choices=["auto", "fft", "stft", "fft_window"],
-                        help="Data mode: auto/fft/stft/fft_window")
+    parser.add_argument("--data_mode", type=str, default="auto", choices=["auto", "fft", "fft_window"],
+                        help="Data mode: auto/fft/fft_window")
 
     # 运行配置
     parser.add_argument("--device", type=str, default="cuda", help='Device, e.g. "cuda", "cuda:0", "cpu"')

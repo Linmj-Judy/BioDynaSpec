@@ -819,8 +819,19 @@ class GaussianDiffusion:
                     # Divide by 1000 for equivalence with initial implementation.
                     # Without a factor of 1/1000, the VB term hurts the MSE term.
                     terms["vb"] *= self.num_timesteps / 1000.0
-            terms["pred_xstart"] = model_output
-            
+            # `pred_xstart` is consumed downstream as a *clean spectrum* estimate
+            # (SpectrumChunkLoss, recover_spectrum_from_tokens), so it must hold
+            # the x_0 prediction no matter which quantity the network outputs.
+            # Under START_X the network output already is x_0; under EPSILON it is
+            # eps and has to be converted through the same identity that
+            # p_mean_variance() uses above.
+            if self.model_mean_type == ModelMeanType.START_X:
+                terms["pred_xstart"] = model_output
+            else:
+                terms["pred_xstart"] = self._predict_xstart_from_eps(
+                    x_t=x_t, t=t, eps=model_output
+                )
+
             target = {
                 ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
                     x_start=x_start, x_t=x_t, t=t

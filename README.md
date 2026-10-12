@@ -30,7 +30,7 @@ Generating long-horizon, all-atom molecular dynamics (MD) is difficult due to er
 Time-domain autoregressive models for protein dynamics suffer from cumulative error drift and are locked to a fixed temporal step size. BioDynaSpec addresses these fundamental limitations by operating in the **frequency domain**: trajectories are decomposed via windowed Fourier transforms, and generation proceeds from low to high frequencies—naturally capturing the hierarchy of protein motions from slow collective modes to fast local fluctuations.
 
 <p align="center">
-  <img src="figures/mj_motivation.pdf" width="90%" alt="Motivation: Why frequency-domain generation?" />
+  <img src="figures/mj_motivation.png" width="90%" alt="Motivation: Why frequency-domain generation?" />
 </p>
 
 **Figure 1.** Motivation for spectral-domain protein dynamics generation. Time-domain autoregressive models accumulate errors over long horizons, while frequency-domain generation via IWFD decouples temporal resolution from step count and naturally respects the multi-scale nature of protein motions.
@@ -48,7 +48,7 @@ BioDynaSpec consists of three core components:
 3. **Inter-Residue Frequency Coupling (IRFC):** A learnable Gaussian distance bias injected into the attention mechanism, providing a resonance-inspired structural prior that enforces cross-residue, cross-frequency consistency and stabilizes training.
 
 <p align="center">
-  <img src="figures/BDSmethond_v2.pdf" width="95%" alt="BioDynaSpec Method Overview" />
+  <img src="figures/BDSmethond_v2.png" width="95%" alt="BioDynaSpec Method Overview" />
 </p>
 
 **Figure 2.** Overview of the BioDynaSpec architecture. (Left) IWFD decomposes trajectories into windowed frequency representations. (Center) The autoregressive diffusion generator predicts spectral coefficients from low to high frequency. (Right) IRFC injects structural priors via learnable Gaussian distance biases in attention.
@@ -80,7 +80,7 @@ bash dependencies.sh
 ```
 
 This will:
-1. Create a conda environment named `A800_dl_cu124` with Python 3.11
+1. Create a conda environment named `torch` with Python 3.11
 2. Install system dependencies (GCC 13.3, OpenBLAS)
 3. Install PyTorch 2.6.0 with CUDA 12.4
 4. Install all required Python packages
@@ -88,7 +88,7 @@ This will:
 ### Step 3: Activate Environment
 
 ```bash
-conda activate A800_dl_cu124
+conda activate torch
 ```
 
 ### Key Dependencies
@@ -122,75 +122,180 @@ To disable WandB, set `use_wandb: false` in the config YAML.
 
 ## Data Preparation
 
-BioDynaSpec is evaluated on the [ATLAS](https://www.dsimb.inserm.fr/ATLAS/) dataset of all-atom MD simulations. The data preparation pipeline involves several steps:
-
-### Step 0: Download ATLAS Data
-
-```bash
-# Download ATLAS trajectory files and metadata
-python runner/data_prepare/download_atlas_cifs.py
-```
-
-> **Note:** Set environment variables `ATLAS_CSV_PATH`, `CIF_SAVE_DIR`, and `CHAIN_OUTPUT_DIR` to customize data paths. Defaults are under `./data/`.
-
-### Step 1: Extract Trajectory Frames
+BioDynaSpec is evaluated on the [ATLAS](https://www.dsimb.inserm.fr/ATLAS/) dataset of
+all-atom MD simulations. Below is the **complete** path from raw ATLAS downloads to the
+tensors that `scripts/pretrain.sh` reads. Every stage is driven by one script:
 
 ```bash
-bash scripts/extract_frames.sh
+bash scripts/generate_data.sh --all          # run everything, start to finish
+bash scripts/generate_data.sh --all --dry-run # show the plan, run nothing
+bash scripts/generate_data.sh --stage assemble --stage normalize  # just re-run two stages
 ```
 
-This extracts coordinate frames from raw MD trajectories and saves them as `.npy` files. Configure paths via environment variables:
+`generate_data.sh` locates the `torch` conda env itself, so it works from a shell where
+nothing is activated. Override any path with an environment variable (see the CONFIG block
+at the top of the script).
+
+### Pipeline overview
+
+```
+                     raw ATLAS (.tpr/.xtc)
+                              │
+        ┌─────────────────────┴──────────────────────┐
+        │ Stage 1  extract_frames                    │  Cα only (paper Sec. 3.1)
+        ▼                                            │
+   <ID>_frames_coords.npy  (T, N_res, 3)             │
+        │                                            │
+        │   mmCIF ──► Stage 2  prepare_md_training_data
+        │                    ├─ bioassembly/<pdb>.pkl.gz   (rotation matrices, aatype)
+        │                    ├─ sequences/pdb_seq.csv
+        │                    └─ indices/atlas_traj_indices.csv
+        │                                            │
+        │              Stage 3  compute_esm           │
+        │                    └─ esm_cache/<shard>/<pdb>_<ent>.pt  (N_res, 1280)
+        │                                            │
+        └───────────────► Stage 4  assemble_training_dataset.py
+                              └─ atlas_10_features_fouriered_list_{train,val,test}.pth
+                                     │
+                              Stage 5  compute_fft_window_scaling.py
+                                     └─ *_normalized.pth  +  *_scaling_factors.pth
+                                     │
+                              scripts/pretrain.sh
+```
+
+Two stages deserve emphasis, because they are the ones most often missing when someone
+tries to reproduce this pipeline:
+
+* **Stage 4 (assemble)** is what turns per-trajectory arrays into the *list of per-protein
+  dicts* that the dataset classes actually index. Nothing downstream of it can run without
+  it: `replace_positions_full_fft_atlas.py` and `compute_fft_window_scaling.py` only
+  *transform* an existing `.pth`, they never create one.
+* **Stage 5 (normalize)** is what computes the per-frequency scale factors `s_f`
+  (95th percentile of coefficient magnitudes, **training split only**) and applies them —
+  the `~/s_f` normalization in paper Eq. (7)/(17).
+
+### Stage 0 — download ATLAS metadata + mmCIF *(optional, network)*
 
 ```bash
-export ATLAS_RAW_DIR="./data/raw_data/ATLAS"
-export ATLAS_TRAJ_DIR="./data/trajectories/atlas"
+export ATLAS_CSV_PATH=./data/raw_data/ATLAS.csv   # ATLAS metadata table
+export MMCIF_DIR=./data/mmcifs                    # where mmCIF structures land
+bash scripts/generate_data.sh --stage download
 ```
+Skip this if you already have the mmCIFs; the raw `.tpr/.xtc` trajectories come from the
+[ATLAS website](https://www.dsimb.inserm.fr/ATLAS/) directly.
 
-### Step 2: Compute Protein Representations
+### Stage 1 — extract Cα frames from raw trajectories
 
-**ESM Embeddings:**
+Expects `$ATLAS_RAW_DIR/<pdb>_<chain>/total/<pdb>_<chain>_prod_<R1|R2|R3>.{tpr,xtc}`
+and writes `$TRAJ_DIR/<ID>_<R#>/<ID>_<R#>_ca_frames_coords.npy` of shape `(T, N_res, 3)`.
 
 ```bash
-bash runner/data_prepare/4_compute_esm/compute_esm.sh
+export ATLAS_RAW_DIR=./data/raw_data/ATLAS
+export TRAJ_DIR=./data/trajectories/atlas
+bash scripts/generate_data.sh --stage extract
 ```
 
-**BiHiTo Token Representations:**
+> **The extraction is Cα-only, and that is deliberate.** BioDynaSpec is a residue-level
+> model: `USE_CA_ONLY = True` in
+> `runner/data_prepare/extract_frames/save_frames_to_npy_atlas.py`, so `N` is the residue
+> count and `x_t ∈ R^{N_r×3}` exactly as in paper Sec. 3.1 / Eq. (1). Set it to `False`
+> only if you deliberately want multi-atom frames — the rest of the pipeline assumes one
+> representative atom per residue, and `replace_positions_full_fft_atlas.py` defaults to
+> `--atom_selection "name CA"` for the same reason.
+
+### Stage 2 — bioassembly + sequence/trajectory indices
+
+Turns the mmCIF structures into the per-PDB metadata (backbone rotation matrices, amino-acid
+types) and writes the trajectory index CSV that Stage 4 consumes.
 
 ```bash
-# Requires BiHiTo repository and checkpoint
-export BIHITO_ROOT="/path/to/BiHiTo"
-export BIHITO_CHECKPOINT_PATH="/path/to/bihito_checkpoint.ckpt"
-bash runner/data_prepare/5_compute_bihito/run.sh
+bash scripts/generate_data.sh --stage features
 ```
+Produces:
+* `$BIOASSEMBLY_DIR/<pdb>.pkl.gz` — rotation matrices, aatype, atom metadata
+* `$SEQ_INDEX_DIR/pdb_seq.csv` — sequences (input to Stage 3)
+* `data/indices/atlas_traj_indices.csv` — columns `traj_name,pdb_name`
 
-### Step 3: Generate Windowed FFT Dataset
+### Stage 3 — ESM-2 embeddings
 
-This is the main data preprocessing step that computes the Independent Windowed Fourier Decomposition (IWFD):
+BioDynaSpec conditions on **ESM-2-650M** (1280-d) embeddings, matching paper Sec. 4.2.
 
 ```bash
-bash scripts/generate_data.sh
+export ESM_MODEL_NAME=esm2-650m          # 1280-d. Do NOT use esm2-3b (2560-d).
+bash scripts/generate_data.sh --stage esm
 ```
 
-This script:
-1. Applies windowed FFT (window size = 2500 frames, 10ps timestep) to all trajectories
-2. Computes per-frequency scaling factors (95th percentile normalization)
-3. Produces normalized train/val/test splits
+> **Dimension trap.** `configs/configs_model.py` also lists `esm2-3b`, which is **2560-d**.
+> The model config (`esm_dim: 1280`), `featureextractor.py`, and `protein_spectrum_far.py`
+> all hard-code 1280, so a 3B cache will not load. The script warns if you select it.
 
-After completion, the dataset directory should contain:
+### Stage 4 — assemble the training dataset
+
+```bash
+bash scripts/generate_data.sh --stage assemble
+```
+
+Joins frames + bioassembly + ESM into `List[dict]` and writes
+`$DATASET_DIR/fft_window<W>/atlas_10_features_fouriered_list_{train,val,test}.pth`,
+one entry per trajectory:
+
+| key | type / shape | meaning |
+|---|---|---|
+| `id` | `str` | e.g. `16pk_A_R1` |
+| `amino_acid_types` | `LongTensor (N,)` | 0–19, non-standard → 20 |
+| `rotation_matrices0` | `FloatTensor (N,3,3)` | backbone frames from the bioassembly |
+| `esm` | `FloatTensor (N,1280)` | ESM-2-650M per residue |
+| `positions.x/y/z` | `list[N]` of `ndarray (F,2)` | full-trajectory rFFT half-spectrum |
+| `positions.x0/y0/z0` | `ndarray (N,)` | anchor frame (aligned frame 0) |
+| `positions.x_fft_windows` | `list[n_win]` of `list[N]` of `ndarray (F,2)` | **what training iterates over** |
+| `positions.x0_fft_windows` | `list[n_win]` of `ndarray (N,)` | per-window anchor |
+| `positions.fft_window_size` | `int` | `W` (2500) |
+| `positions.fft_hop_ratio` | `float` | `1.0` = non-overlapping (paper §IWFD) |
+| `positions.preprocess_state_fft_windows` | `list[dict]` | COM removal + Kabsch transform, for inverting alignment |
+
+Key defaults: `--window_size 2500`, `--hop_ratio 1.0` (**non-overlapping**, as the paper
+requires), `--dt_str 10ps`, `--esm_dim 1280`, `--ratios 0.93/0.03/0.04` (the paper's
+1269/39/82 split), `--max_residues 1000` (matches the trainer's own length filter).
+
+For very large runs use `--shard_size N` to write shards instead of one multi-GB file.
+
+### Stage 5 — per-frequency scaling and normalization
+
+```bash
+bash scripts/generate_data.sh --stage normalize
+```
+
+Computes `s_f` as the 95th percentile of `|S_f|` over the **training split only**, then
+divides every coefficient by `s_f` (paper Eq. 7). Writes:
 
 ```
-dataset/
+$DATASET_DIR/fft_window2500/
+├── atlas_10_features_fouriered_list_{train,val,test}.pth              # unnormalized
+├── atlas_10_features_fouriered_list_{train,val,test}_normalized.pth   # <- training reads these
+└── fft_window2500_scaling_factors.pth                                 # s_f
+```
+
+With `W = 2500` the half-spectrum has `F = ⌊W/2⌋ + 1 = 1251` non-negative bins, which is
+what paper Eq. (2) and the `--num_freq 1251` default encode.
+
+### Expected final layout
+
+```
+dataset/                          # configs point at ./dataset/... (symlink it if needed)
 ├── fft_window2500/
 │   ├── atlas_10_features_fouriered_list_train_normalized.pth
 │   ├── atlas_10_features_fouriered_list_val_normalized.pth
 │   ├── atlas_10_features_fouriered_list_test_normalized.pth
 │   └── fft_window2500_scaling_factors.pth
-├── bihito_repr_cache/
-│   └── atlas/
-├── feature_cache/
-│   └── atlas/
-└── esm_cache/
-    └── esm2_3b_embed/
+├── bioassembly/atlas/            # Stage 2
+├── sequences/                    # Stage 2
+└── esm_cache/esm2_650m_embed/    # Stage 3
+```
+
+Then train:
+
+```bash
+bash scripts/pretrain.sh --config configs/trainer_BioDynaSpec.yaml
 ```
 
 ---
@@ -376,14 +481,14 @@ BioDynaSpec/
 │   ├── trainer_BioDynaSpec_wo_irfc.yaml # Ablation config (without IRFC)
 │   ├── trainer_far_example.yaml       # Example/template config
 │   ├── configs_data.py                # Data path configuration
-│   └── configs_olmo_model.py          # OLMo model configuration
+│   ├── configs_model.py               # ESM model registry (ESM_CONFIG)
+│   └── config_utils.py                # Env-backed config helpers
 │
 ├── scripts/                           # Launch scripts
 │   ├── pretrain.sh                    # Training launcher
 │   ├── inference.sh                   # Inference launcher
 │   ├── generate_data.sh              # Data generation pipeline
-│   ├── extract_frames.sh             # Frame extraction from MD
-│   └── ray_tune.sh                   # Hyperparameter search
+│   └── extract_frames.sh             # Frame extraction from MD
 │
 ├── src/                               # Source code
 │   ├── trainer_far.py                 # PyTorch Lightning training loop
@@ -391,7 +496,6 @@ BioDynaSpec/
 │   ├── main_model.py                  # Model wrapper + LR scheduler
 │   ├── inferencer_far.py              # Inference engine
 │   ├── featureextractor.py            # Protein feature extraction
-│   ├── data_fourier.py                # Fourier data loading
 │   │
 │   ├── model/                         # Model components
 │   │   ├── diffloss.py                # Diffusion loss (SpectrumDiffLoss)
@@ -401,12 +505,10 @@ BioDynaSpec/
 │   │   │   ├── respace.py             # Diffusion step respacing
 │   │   │   └── diffusion_utils.py     # Diffusion utilities
 │   │   ├── loss/                      # Loss functions
-│   │   │   ├── spectrum_loss.py       # SpectrumChunkLoss
-│   │   │   └── spectrum_fid.py        # Spectral FID metric
+│   │   │   └── spectrum_loss.py       # SpectrumChunkLoss
 │   │   └── modules/                   # Neural network modules
-│   │       ├── transformer.py         # Diffusion Transformer
-│   │       ├── attention.py           # Attention mechanisms
-│   │       ├── olmo_transformer.py    # OLMo Transformer blocks
+│   │       ├── transformer.py         # Diffusion Transformer (adapted from
+│   │       │                          #   AlphaFold3/Protenix; holds the IRFC bias)
 │   │       └── primitives.py          # Basic building blocks
 │   │
 │   ├── data/                          # Data processing
@@ -415,27 +517,39 @@ BioDynaSpec/
 │   │   └── basic/                     # Basic data utilities
 │   │       └── compute_esm.py         # ESM embedding computation
 │   │
-│   ├── openfold_local/                # Local OpenFold modules (IPA, etc.)
+│   ├── openfold_local/                # Local OpenFold modules (IPA, triangular attn)
 │   ├── protenix/                      # Local Protenix modules
 │   ├── utils/                         # General utilities
 │   └── visualize/                     # Visualization tools
 │
 ├── runner/                            # Data preparation runners
 │   └── data_prepare/
+│       ├── assemble_training_dataset.py         # Builds the *.pth data_list
 │       ├── replace_positions_full_fft_atlas.py  # IWFD preprocessing
 │       ├── compute_fft_window_scaling.py        # Scaling factor computation
 │       ├── download_atlas_cifs.py               # ATLAS data download
-│       ├── 0_extract_frames/                    # Frame extraction
+│       ├── extract_frames/                      # Frame extraction
 │       ├── 2_prepare_data/                      # Data cleaning
-│       ├── 4_compute_esm/                       # ESM computation
-│       └── 5_compute_bihito/                    # BiHiTo computation
+│       └── 4_compute_esm/                       # ESM computation
+│
+├── evaluation/                        # Model-independent metrics (see its README)
+│   ├── metrics/
+│   │   ├── trajectory.py              # Kabsch RMSD / RMSF primitives
+│   │   ├── analyze_ensembles.py       # PCA-W2, EMD, contact prob, SASA/MI
+│   │   ├── reconstruction_ensembles.py# Compact paper-facing metric table
+│   │   ├── spectrum.py                # Fourier-domain MSE
+│   │   └── coordinates.py             # Coordinate MSE + framewise RMSD
+│   └── analysis_kevin/                # Paper protocol: R_s, PCA-2D Pearson/Hausdorff
+│
+├── tests/                             # Regression tests (pytest)
 │
 ├── dataset/                           # Processed datasets (generated)
 │   └── fft_window2500/                # Windowed FFT data
 │
-├── figures/                           # Paper figures
-│   ├── mj_motivation.pdf              # Motivation figure
-│   └── BDSmethond_v2.pdf             # Method overview figure
+├── figures/                           # Paper figures (PNG for README rendering)
+│   ├── mj_motivation.png              # Motivation figure
+│   ├── BDSmethond_v2.png              # Method overview figure
+│   └── TICA/                          # TICA projection figure
 │
 └── logs/                              # Training/inference logs
 ```
@@ -453,9 +567,9 @@ All paths in the codebase are configurable via environment variables or command-
 | `ATLAS_TRAJ_DIR` | `./data/trajectories/atlas` | Extracted trajectory frames |
 | `DATASET_DIR` | `./dataset` | Processed dataset directory |
 | `FEATURE_CACHE_DIR` | `./dataset/feature_cache/atlas` | Feature cache directory |
-| `BIHITO_ROOT` | (must be set) | BiHiTo repository path |
-| `BIHITO_CHECKPOINT_PATH` | (must be set) | BiHiTo model checkpoint |
+| `ESM_MODEL_NAME` | `esm2-650m` | ESM variant key in `configs/configs_model.py` |
 | `ESM_MODEL_ROOT_DIR` | `./data/esm_models` | ESM model weights directory |
+| `ESM_SAVE_DIR` | `./dataset/esm_cache/esm2_650m_embed` | ESM embedding output directory |
 | `WANDB_API_KEY` | (optional) | Weights & Biases API key |
 | `NUM_GPUS` | Auto-detected | Number of GPUs for training |
 | `MASTER_PORT` | `29500` | Port for distributed training |
@@ -469,10 +583,12 @@ For a minimal end-to-end run (assuming ATLAS data and pretrained representations
 ```bash
 # 1. Setup environment
 bash dependencies.sh
-conda activate A800_dl_cu124
+conda activate torch
 
-# 2. Generate windowed FFT dataset
-bash scripts/generate_data.sh
+# 2. Build the dataset from raw ATLAS (see "Data Preparation" for each stage).
+#    --dry-run first prints the plan without running anything.
+bash scripts/generate_data.sh --all --dry-run
+bash scripts/generate_data.sh --all
 
 # 3. Train BioDynaSpec (single GPU)
 bash scripts/pretrain.sh --config configs/trainer_BioDynaSpec.yaml
@@ -492,7 +608,8 @@ bash scripts/inference.sh \
 | CUDA OOM during training | Reduce `batch_size`, `max_spectrum_len`, or enable `use_checkpoint: true` in config |
 | NCCL timeout in multi-GPU | Set `NCCL_IB_DISABLE=1` or adjust `NCCL_P2P_DISABLE` |
 | WandB authentication error | Set `WANDB_API_KEY` env var or run `wandb login`, or disable with `use_wandb: false` |
-| Missing BiHiTo/ESM models | These are required for data preprocessing; see [Data Preparation](#data-preparation) |
+| Missing ESM model weights | Required for data preprocessing; see [Data Preparation](#data-preparation) |
+| `ModuleNotFoundError: No module named 'openfold'` | Expected if you import `esm.esmfold` directly; the repo root provides a shim aliasing `openfold` to `src/openfold_local`. Keep the project root on `PYTHONPATH`. |
 
 ---
 

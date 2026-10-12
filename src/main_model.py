@@ -5,7 +5,7 @@ import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.strategies import DDPStrategy
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import DataLoader
 import torch.nn.functional as F
 import random
 import numpy as np

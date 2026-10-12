@@ -1,9 +1,138 @@
 import torch
-from torch.utils.data import Dataset, DataLoader, IterableDataset
+from torch.utils.data import Dataset, DataLoader, IterableDataset, get_worker_info
+import json
 import numpy as np
 import random
-from torchdrug import data
 import os
+
+
+def _owns_index(idx, stream_rank, stream_world):
+    """Deterministic, disjoint assignment of index `idx` to one stream."""
+    if stream_world <= 1:
+        return True
+    return idx % stream_world == stream_rank
+
+
+def _shard_manifest(path):
+    """Return the manifest dict if `path` is a shard directory, else None."""
+    if not os.path.isdir(path):
+        return None
+    mpath = os.path.join(path, "manifest.json")
+    if not os.path.isfile(mpath):
+        return None
+    with open(mpath) as fh:
+        return json.load(fh)
+
+
+def _rank_and_world():
+    """This process's DDP rank. Workers are handled separately, in `__iter__`."""
+    try:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank(), dist.get_world_size()
+    except Exception:
+        pass
+    return 0, 1
+
+
+def _worker_and_count():
+    """This DataLoader worker's id/count, or (0, 1) outside a worker."""
+    worker = get_worker_info()
+    if worker is None:
+        return 0, 1
+    return worker.id, worker.num_workers
+
+
+def _owns_index(idx, stream_rank, stream_world):
+    """Deterministic, disjoint assignment of index `idx` to one stream."""
+    if stream_world <= 1:
+        return True
+    return idx % stream_world == stream_rank
+
+
+def _shard_manifest(path):
+    """Return the manifest dict if `path` is a shard directory, else None."""
+    if not os.path.isdir(path):
+        return None
+    mpath = os.path.join(path, "manifest.json")
+    if not os.path.isfile(mpath):
+        return None
+    with open(mpath) as fh:
+        return json.load(fh)
+
+
+def _load_protein_list(data_path):
+    """Load the protein dicts this *rank* is responsible for.
+
+    Returns `(proteins, split_by_worker)`.
+
+    Why rank-level here and worker-level later: the dataset object is built in
+    the parent process (Lightning calls `setup()` before spawning workers), so
+    `get_worker_info()` is unavailable at this point. Splitting shards by worker
+    here would therefore be wrong. Instead:
+
+      * the parent loads only this rank's shards -- this is the memory win, and
+        forked workers inherit that reduced list via copy-on-write;
+      * `__iter__` then splits the rank's proteins across its workers.
+
+    `split_by_worker` is True only when this rank holds the WHOLE list (a
+    monolithic `.pth`, or a shard count that does not tile the rank grid). Then
+    `__iter__` must split by rank * worker, or ranks would duplicate each
+    other's data.
+    """
+    manifest = _shard_manifest(data_path)
+    if manifest is None:
+        return torch.load(data_path, weights_only=False), True, None
+
+    shards = [os.path.join(data_path, s) for s in manifest["shards"]]
+    rank, world = _rank_and_world()
+    counts = manifest.get("counts")
+
+    # Each rank takes an equal, contiguous block of shards.
+    if world > 1 and len(shards) % world == 0:
+        per_rank = len(shards) // world
+        lo, hi = rank * per_rank, (rank + 1) * per_rank
+        mine = shards[lo:hi]
+        # Load this rank's shards CONCURRENTLY. The store is a network FS whose
+        # single-stream bandwidth is only ~75 MB/s but scales near-linearly
+        # (measured 4 streams -> 289 MB/s, 8 -> 563 MB/s), so a sequential loop
+        # over ~15 shards (15 x 7 GB) would spend most of an hour here.
+        from concurrent.futures import ThreadPoolExecutor
+        out = []
+        with ThreadPoolExecutor(max_workers=min(8, len(mine))) as ex:
+            for chunk in ex.map(lambda f: torch.load(f, weights_only=False), mine):
+                out.extend(chunk)
+        # Contiguous shard blocks hold different NUMBERS of windows, so ranks
+        # would run different step counts. Return the maximum so `__iter__` can
+        # top up the short ranks; without this DDP hangs on the all-reduce.
+        #
+        # This must use WINDOW counts, not protein counts: proteins differ in how
+        # many windows they hold, so equal proteins does not mean equal steps.
+        # (Measured: 8 train shards hold 47/47/.../46 proteins but
+        # 188/188/.../184 windows, so 2-shard blocks are 376/376/376/372.)
+        window_counts = manifest.get("window_counts")
+        target = None
+        if window_counts and len(window_counts) == len(shards):
+            blocks = [
+                sum(window_counts[i:i + per_rank])
+                for i in range(0, len(shards), per_rank)
+            ]
+            target = max(blocks)
+        return out, False, target          # workers split within the rank
+
+    # Single process, or a shard count that does not tile the rank grid: load
+    # everything and let `__iter__` partition by rank x worker. Slower and much
+    # more memory, but correct and never drops data.
+    #
+    # This path is avoided by making `num_workers * num_gpus` divide the shard
+    # count; it exists only as a safety net.
+    from concurrent.futures import ThreadPoolExecutor
+    out = []
+    with ThreadPoolExecutor(max_workers=min(8, len(shards))) as ex:
+        for chunk in ex.map(lambda f: torch.load(f, weights_only=False), shards):
+            out.extend(chunk)
+    return out, True, None
+
 
 class ProteinMotionDataset(Dataset):
     def __init__(self, data_path, bihito_repr_dir=None):
@@ -439,125 +568,181 @@ class ProteinMotionFFTWindowDataset(IterableDataset):
     """
     def __init__(self, data_path: str, bihito_repr_dir=None):
         super().__init__()
-        self.data = torch.load(data_path, weights_only=False)
-        self.data = [data for data in self.data if data["positions"].get("x_fft_windows") is not None]
+        # Deferred: the protein list is loaded lazily in `__iter__` so the
+        # worker id is correct (see `_load_protein_list`).
+        self.data_path = data_path
         self.bihito_repr_dir = bihito_repr_dir
+        self._protein_cache = None
         self._num_samples = None
-        self._compute_num_samples()
+        self._counts_probed = False
 
-    def _compute_num_samples(self):
-        total = 0
-        for protein_data in self.data:
-            positions = protein_data["positions"]
-            x_windows = positions.get("x_fft_windows", [])
-            if not x_windows:
-                continue
-            total += len(x_windows)
-        self._num_samples = total
+    def _protein_list(self):
+        """Load this process's proteins, ONCE per process.
+
+        The result is cached. `torch.load` of a shard is tens of seconds and a
+        rank can own ~160 GB of them, while `__iter__` runs once per epoch and
+        `__len__` may run earlier -- without this cache the split is re-read
+        from disk every epoch (measured: 10.6 GB of reads in 6 minutes before
+        the first epoch even began).
+        """
+        if self._protein_cache is None:
+            data, needs_split, step_target = _load_protein_list(self.data_path)
+            data = [d for d in data if d["positions"].get("x_fft_windows") is not None]
+            self._protein_cache = (data, needs_split, step_target)
+        return self._protein_cache
 
     def __len__(self):
-        return int(self._num_samples) if self._num_samples is not None else 0
+        """Window count for THIS rank/worker.
+
+        Exact: it is derived from the same list `__iter__` will walk, so it can
+        never disagree with the number of samples yielded.
+        """
+        if self._num_samples is None:
+            data, _needs_split, _target = self._protein_list()
+            self._num_samples = sum(
+                len(d["positions"].get("x_fft_windows", [])) for d in data
+            )
+        return int(self._num_samples)
 
     def __iter__(self):
-        for protein_data in self.data:
-            positions = protein_data["positions"]
-            x_windows = positions.get("x_fft_windows", [])
-            y_windows = positions.get("y_fft_windows", [])
-            z_windows = positions.get("z_fft_windows", [])
-            x0_windows = positions.get("x0_fft_windows", [])
-            y0_windows = positions.get("y0_fft_windows", [])
-            z0_windows = positions.get("z0_fft_windows", [])
-            window_size = positions.get("fft_window_size", None)
-            id_str = protein_data["id"]
-            if not x_windows or not y_windows or not z_windows:
-                continue
+        data, needs_split, step_target = self._protein_list()
+        worker_id, worker_count = _worker_and_count()
+        if needs_split:
+            rank, world = _rank_and_world()
+            stream_rank, stream_world = rank * worker_count + worker_id, world * worker_count
+        else:
+            stream_rank, stream_world = worker_id, worker_count
 
-            # bihito_repr_path = os.path.join(self.bihito_repr_dir, f"{id_str.lower()}.pt")
-            # if os.path.exists(bihito_repr_path):
-            #     bihito_repr_dict = torch.load(bihito_repr_path, weights_only=False)
-            #     for key, value in bihito_repr_dict.items():
-            #         if isinstance(value, torch.Tensor):
-            #             bihito_repr_dict[key] = value.detach().requires_grad_(False)
-            #         if isinstance(value, dict):
-            #             for sub_key, sub_value in value.items():
-            #                 if isinstance(sub_value, torch.Tensor):
-            #                     value[sub_key] = sub_value.detach().requires_grad_(False)
-            # else:
-            #     raise ValueError(
-            #         f"bihito representation not found for {id_str.lower()}, "
-            #         "please run BiHiTo_private-mix1/scripts/test_pdb_dir.sh first to generate it"
-            #     )
+        # Partition the stream across DDP ranks and workers, but only when this
+        # process holds the WHOLE list. A pre-split shard already *is* this
+        # process's share, so skipping inside it would drop data.
+        owned = [
+            p for idx, p in enumerate(data)
+            if not needs_split or _owns_index(idx, stream_rank, stream_world)
+        ]
 
-            num_windows = len(x_windows)
-            for w in range(num_windows):
-                spectrum_x_real = [item[:, 0] for item in x_windows[w]]
-                spectrum_x_imag = [item[:, 1] for item in x_windows[w]]
-                spectrum_y_real = [item[:, 0] for item in y_windows[w]]
-                spectrum_y_imag = [item[:, 1] for item in y_windows[w]]
-                spectrum_z_real = [item[:, 0] for item in z_windows[w]]
-                spectrum_z_imag = [item[:, 1] for item in z_windows[w]]
+        # DDP requires every rank to execute the same number of optimizer steps:
+        # each step ends in a gradient all-reduce, and a rank that runs out of
+        # data stops calling it while the others keep waiting -> the collective
+        # hangs until the NCCL watchdog aborts the job (observed: rank 0 had 372
+        # windows against 376 on the others, hang at step 373).
+        #
+        # `step_target` is the largest per-rank window count, derived from the
+        # shard manifest. Ranks below it cycle their own data again -- at most a
+        # few windows out of ~375 per epoch -- rather than any rank idling.
+        if not owned:
+            # Nothing to yield. Returning (rather than looping) keeps this a
+            # generator that terminates instead of spinning forever when a
+            # non-None step_target can never be reached.
+            return
 
-                spectrum = np.stack(
-                    [
-                        spectrum_x_real, spectrum_x_imag,
-                        spectrum_y_real, spectrum_y_imag,
-                        spectrum_z_real, spectrum_z_imag,
-                    ],
-                    axis=-1,
-                )  # [N, F, 6]
-                spectrum = torch.tensor(spectrum, dtype=torch.float32).unsqueeze(-1)
+        emitted = 0
+        while True:
+            for protein_data in owned:
+                for sample in self._protein_windows(protein_data):
+                    yield sample
+                    emitted += 1
+                    if step_target is not None and emitted >= step_target:
+                        return
+            if step_target is None:
+                return   # single pass: no sharding, no rank synchronisation
 
-                coords = torch.tensor(
-                    np.stack([x0_windows[w], y0_windows[w], z0_windows[w]], axis=-1),
-                    dtype=torch.float32,
-                )
-                rotation_matrices = protein_data["rotation_matrices0"].clone().detach().requires_grad_(True)
-                aatype = protein_data["amino_acid_types"].clone().detach()
-                aa_mask = torch.ones(aatype.shape, dtype=torch.bool)
-                esm_s_protein = protein_data["esm"]
-                first_frame_idx = int(w * window_size) if window_size is not None else 0
-                if "bihito_token_repr" not in protein_data:
-                    bihito_token_repr = None
-                else:
-                    bihito_token_repr = protein_data['bihito_token_repr']
+    def _protein_windows(self, protein_data):
+        """Yield this protein's per-window samples (7- or 10-tuple each)."""
+        if True:
+                positions = protein_data["positions"]
+                x_windows = positions.get("x_fft_windows", [])
+                y_windows = positions.get("y_fft_windows", [])
+                z_windows = positions.get("z_fft_windows", [])
+                x0_windows = positions.get("x0_fft_windows", [])
+                y0_windows = positions.get("y0_fft_windows", [])
+                z0_windows = positions.get("z0_fft_windows", [])
+                window_size = positions.get("fft_window_size", None)
+                id_str = protein_data["id"]
+                if not x_windows or not y_windows or not z_windows:
+                    return   # this protein has no windows; skip just it
 
-                yield (
-                    coords.detach(),
-                    spectrum.detach(),
-                    rotation_matrices.detach(),
-                    aatype.detach(),
-                    aa_mask.detach(),
-                    torch.tensor(esm_s_protein),
-                    bihito_token_repr,
-                )
+                # bihito_repr_path = os.path.join(self.bihito_repr_dir, f"{id_str.lower()}.pt")
+                # if os.path.exists(bihito_repr_path):
+                #     bihito_repr_dict = torch.load(bihito_repr_path, weights_only=False)
+                #     for key, value in bihito_repr_dict.items():
+                #         if isinstance(value, torch.Tensor):
+                #             bihito_repr_dict[key] = value.detach().requires_grad_(False)
+                #         if isinstance(value, dict):
+                #             for sub_key, sub_value in value.items():
+                #                 if isinstance(sub_value, torch.Tensor):
+                #                     value[sub_key] = sub_value.detach().requires_grad_(False)
+                # else:
+                #     raise ValueError(
+                #         f"bihito representation not found for {id_str.lower()}, "
+                #         "please run BiHiTo_private-mix1/scripts/test_pdb_dir.sh first to generate it"
+                #     )
+
+                num_windows = len(x_windows)
+                for w in range(num_windows):
+                    spectrum_x_real = [item[:, 0] for item in x_windows[w]]
+                    spectrum_x_imag = [item[:, 1] for item in x_windows[w]]
+                    spectrum_y_real = [item[:, 0] for item in y_windows[w]]
+                    spectrum_y_imag = [item[:, 1] for item in y_windows[w]]
+                    spectrum_z_real = [item[:, 0] for item in z_windows[w]]
+                    spectrum_z_imag = [item[:, 1] for item in z_windows[w]]
+
+                    spectrum = np.stack(
+                        [
+                            spectrum_x_real, spectrum_x_imag,
+                            spectrum_y_real, spectrum_y_imag,
+                            spectrum_z_real, spectrum_z_imag,
+                        ],
+                        axis=-1,
+                    )  # [N, F, 6]
+                    spectrum = torch.tensor(spectrum, dtype=torch.float32).unsqueeze(-1)
+
+                    coords = torch.tensor(
+                        np.stack([x0_windows[w], y0_windows[w], z0_windows[w]], axis=-1),
+                        dtype=torch.float32,
+                    )
+                    rotation_matrices = protein_data["rotation_matrices0"].clone().detach().requires_grad_(True)
+                    aatype = protein_data["amino_acid_types"].clone().detach()
+                    aa_mask = torch.ones(aatype.shape, dtype=torch.bool)
+                    esm_s_protein = protein_data["esm"]
+                    first_frame_idx = int(w * window_size) if window_size is not None else 0
+                    if "bihito_token_repr" not in protein_data:
+                        bihito_token_repr = None
+                    else:
+                        bihito_token_repr = protein_data['bihito_token_repr']
+
+                    yield (
+                        coords.detach(),
+                        spectrum.detach(),
+                        rotation_matrices.detach(),
+                        aatype.detach(),
+                        aa_mask.detach(),
+                        torch.tensor(esm_s_protein),
+                        bihito_token_repr,
+                    )
 
 
 
 def collate_fn(batch):
     """
     Args:
-        batch: List of (graph, coords, spectrum, rotation_matrices, aatype, esm_s_protein)
+        batch: List of (coords, spectrum, rotation_matrices, aatype, esm_s_protein)
     Returns:
-        packed_graph (data.PackedGraph): Packed protein graphs
         coords (torch.Tensor): [total_N, 3] Concatenated coordinates
         spectrum (torch.Tensor): [total_N, 96] Concatenated spectrum
         rotation_matrices (torch.Tensor): [total_N, 3, 3] Concatenated rotation matrices
         aatype (torch.Tensor): [total_N] Concatenated amino acid types
         esm_s_protein (torch.Tensor): [total_N, 1280] Concatenated ESM embeddings
     """
-    graphs, coords, spectrum, rotation_matrices, aatype, esm_s_protein = zip(*batch)
-    
-    # Pack graph structure
-    packed_graph = data.PackedGraph.pack(graphs)
-    
-    # Concatenate other features
+    coords, spectrum, rotation_matrices, aatype, esm_s_protein = zip(*batch)
+
     coords = torch.cat(coords, dim=0)
     spectrum = torch.cat(spectrum, dim=0)
     rotation_matrices = torch.cat(rotation_matrices, dim=0)
     aatype = torch.cat(aatype, dim=0)
     esm_s_protein = torch.cat(esm_s_protein, dim=0)
-    
-    return packed_graph, coords, spectrum, rotation_matrices, aatype, esm_s_protein
+
+    return coords, spectrum, rotation_matrices, aatype, esm_s_protein
 
 
 # 专用于“单蛋白、无 batch”模式：直接返回样本本身（不做 concat / pack）

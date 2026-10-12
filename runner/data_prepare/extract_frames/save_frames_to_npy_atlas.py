@@ -15,7 +15,12 @@ except Exception:
     HAS_GEMMI = False
 
 # ===================== User-configurable switches =====================
+# 只提取 Cα 原子（BioDynaSpec 是 residue-level / Cα-only 建模，见论文 Sec. 3.1）。
+# 设为 False 才会退回按 IGNORE_WATER 选择多原子。
+USE_CA_ONLY = True
+
 # 是否在保存时忽略水分子（使用 MDAnalysis 选择字符串 "water"）
+# 仅在 USE_CA_ONLY = False 时生效。
 IGNORE_WATER = True
 
 # 如你的体系里还有特殊的水残基名不在默认 "water" 关键字内，可在此补充
@@ -31,7 +36,17 @@ suffixes = ["R1", "R2", "R3"]
 # ======================================================================
 
 def _build_selection_string():
-    """根据开关构建选择字符串。"""
+    """根据开关构建选择字符串。
+
+    BioDynaSpec models *residue-level* dynamics on Cα coordinates (paper
+    Sec. 3.1, Eq. 1), so the default selection is CA-only. Set
+    ``USE_CA_ONLY = False`` only if you deliberately want more atoms — the
+    downstream FFT/training pipeline assumes one representative atom per
+    residue, and `replace_positions_full_fft_atlas.py` defaults to ``name CA``
+    for the same reason.
+    """
+    if USE_CA_ONLY:
+        return "name CA"
     if not IGNORE_WATER:
         return None  # 选择全部原子
     sel = "not water"
@@ -45,14 +60,22 @@ def _build_selection_string():
 
 def process_trajectory(task):
     name, suffix = task
-    # tpr_file = os.path.join(base_dir, name, f"{name}.pdb")
-    tpr_file = os.path.join(base_dir, name, "total",f"{name}_prod_{suffix}.tpr")
-    xtc_file = os.path.join(base_dir, name, "total",f"{name}_prod_{suffix}.xtc")
+    # ATLAS ships `<name>/<name>_prod_R{1,2,3}_fit.xtc` -- already PBC-removed and
+    # frame-aligned (see the dataset README: "with PBC removed and frames
+    # aligned"). The old layout here was `<name>/total/<name>_prod_R{n}.xtc`,
+    # which does not exist in the raw data and would have picked up a
+    # PBC-uncorrected trajectory if one were ever present.
+    #
+    # The `_fit` file is REQUIRED: an un-unwrapped trajectory puts a step of
+    # ~box length into the time series, which the rFFT smears across every
+    # frequency bin.
+    tpr_file = os.path.join(base_dir, name, f"{name}_prod_{suffix}.tpr")
+    xtc_file = os.path.join(base_dir, name, f"{name}_prod_{suffix}_fit.xtc")
     save_dir = os.path.join(base_save_dir, f"{name}_{suffix}")
     os.makedirs(save_dir, exist_ok=True)
 
     if not os.path.exists(xtc_file):
-        return f"{name}_{suffix}: MISSING xtc file."
+        return f"{name}_{suffix}: MISSING xtc file: {xtc_file}"
     # preprocess pdb files
     # split_chains(tpr_file, tpr_file)
     
@@ -63,7 +86,9 @@ def process_trajectory(task):
             ag = u.select_atoms(sel_str)
             if len(ag) == 0:
                 return f"{name}_{suffix}: selection '{sel_str}' is empty."
-            sel_tag = "no_water"
+            # Tag the output with what was actually selected, so CA-only data is
+            # not mislabelled as merely "no_water".
+            sel_tag = "ca" if USE_CA_ONLY else "no_water"
         else:
             ag = u.atoms
             sel_tag = "all_atoms"

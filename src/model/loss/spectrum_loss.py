@@ -38,6 +38,23 @@ def rigid_align_spectrum_by_dc(
     device = X_pred_real_positive.device
     dtype = X_pred_real_positive.dtype
 
+    # The rigid alignment below estimates a rotation from the DC (0 Hz) component
+    # via SVD. `align_pred_to_true` uses the covariance A^T A, which is exactly
+    # zero when pred_dc is zero. torch.linalg.svd's backward then divides by
+    # (s_i^2 - s_j^2) = 0 -> NaN, which poisons the whole gradient even though
+    # the forward value stays finite. A freshly-initialised denoiser emits exactly
+    # 0 (adaLN-Zero), so this is hit on the very first optimizer step.
+    #
+    # A zero prediction carries no orientation, so the alignment is a no-op:
+    # skip the SVD and return the prediction unchanged with identity rotations.
+    # The gradient of a rank-deficient SVD is also undefined, so there is no
+    # meaningful rotation gradient to lose here.
+    if float(X_pred_real_positive[..., 0].abs().max()) == 0.0:
+        eye = torch.eye(3, device=device, dtype=dtype)
+        B_dim = X_pred_real_positive.shape[0] if is_batched else 1
+        rot = eye.expand(B_dim, 3, 3) if is_batched else eye
+        return X_pred_real_positive, X_pred_real_positive, rot
+
     if is_batched:
         B, N, _, L = X_pred_real_positive.shape
         pred_dc = X_pred_real_positive[..., 0]  # (B, N_atom, 3)
@@ -207,6 +224,39 @@ class SpectrumLoss(nn.Module):
         scale = (true_real_b.abs() + true_imag_b.abs()).mean().detach() + 1e-6
         return (loss_real.mean() + loss_imag.mean()) / scale
 
+    def _compute_relative_amplitude_mse_loss(
+        self,
+        amplitude_pred: torch.Tensor, # (B, N_atom, 3, seq_len)
+        amplitude_true: torch.Tensor, # (1, N_atom, 3, seq_len)
+    ):
+        """Scale-normalised amplitude MSE.
+
+        Previously this term was a bare `F.mse_loss(A_pred, A_true)`: an
+        unbounded, squared-magnitude quantity with no normalisation, no
+        log-compression and no rigid alignment. It was the only one of the
+        seven aggregated terms with that property (see
+        compute_spectrum_mse_mae_after_rigid_align / _compute_log_spectral_l1_loss
+        / _compute_spectral_convergence_loss for the others), so as prediction
+        error grew it grew quadratically and dominated the summed loss —
+        making the logged `train_loss` a near-monotone function of one
+        unnormalised term rather than a measure of progress.
+
+        Dividing by `mean(A_true^2)` makes the term a *relative* error:
+        scale-free, O(1) when the spectrum is roughly right, and — importantly
+        — non-zero when A_pred == 0 (unlike the frequency-weighted cosine term,
+        which is degenerate there).
+
+        This follows the normalisation the module authors had already sketched
+        out for the complex MSE/MAE losses in `_compute_relative_mse_mae_loss`
+        (the commented-out `scale = (true**2 + true**2).mean() + 1e-6` block).
+        The paper does not state this normalisation explicitly; the omission is
+        recorded in AUDIT.md.
+        """
+        # Detached: the scale is a normaliser, not something we want gradients
+        # flowing through (matches the author's `scale` sketch above).
+        scale = (amplitude_true ** 2).mean().detach() + self.eps
+        return F.mse_loss(amplitude_pred, amplitude_true) / scale
+
     def _compute_log_spectral_l1_loss(
         self,
         amplitude_pred: torch.Tensor, # (B, N_atom, 3, seq_len)
@@ -362,7 +412,7 @@ class SpectrumLoss(nn.Module):
             "smooth_l1_loss": lambda: self._compute_smooth_l1_loss(
                 X_pred_real_positive, X_pred_imag_positive, true_real_b, true_imag_b
             ),
-            "amplitude_mse_loss": lambda: F.mse_loss(A_pred, A_true),
+            "amplitude_mse_loss": lambda: self._compute_relative_amplitude_mse_loss(A_pred, A_true),
             "log_spectral_l1_loss": lambda: self._compute_log_spectral_l1_loss(
                 A_pred, A_true
             ),
@@ -411,7 +461,7 @@ class SpectrumChunkLoss(SpectrumLoss):
             "smooth_l1_loss": lambda: self._compute_smooth_l1_loss(
                 X_pred_real_positive, X_pred_imag_positive, true_real_b, true_imag_b
             ),
-            "amplitude_mse_loss": lambda: F.mse_loss(A_pred, A_true),
+            "amplitude_mse_loss": lambda: self._compute_relative_amplitude_mse_loss(A_pred, A_true),
             "log_spectral_l1_loss": lambda: self._compute_log_spectral_l1_loss(
                 A_pred, A_true
             ),

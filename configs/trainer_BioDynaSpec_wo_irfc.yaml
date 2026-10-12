@@ -33,7 +33,7 @@ max_spectrum_len: 2560
 
 # Diffusion loss parameters
 learn_sigma: false
-predict_xstart: false
+predict_xstart: true   # START_X: network regresses x_0 directly (paper Eq. diff-loss; matches reference trainer)
 sigma_small: false
 noise_schedule: 'cosine'
 use_kl: false
@@ -41,9 +41,11 @@ rescale_learned_sigmas: false
 diffusion_steps: 1000
 
 # 训练相关
-max_epochs: 50
+max_epochs: 2
 lr: 0.0001
-warmup_epochs: 10
+# Must stay < max_epochs, or the scheduler never leaves its linear warmup
+# ramp (see trainer_BioDynaSpec.yaml).
+warmup_epochs: 1
 min_lr: 0.000001
 warmup_start_lr: 0.0000001
 plateau_patience: 8

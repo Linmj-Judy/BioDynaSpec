@@ -18,6 +18,17 @@ from src.data.fourier.utils import (
 from src.protenix.utils import aggregate_atom_to_token
 
 
+# Device for the rFFT. This runs inside a ProcessPoolExecutor, so a CUDA device
+# means every worker allocates on the SAME GPU -- with 48 workers that exhausts
+# an 80 GB card and trajectories fail with OutOfMemoryError / cuFFT
+# CUFFT_ALLOC_FAILED, silently dropping them from the assembled dataset.
+#
+# The transform is a few 2500-point rFFTs per trajectory, which is far cheaper
+# than the IPC cost of shipping coordinates to a GPU, so CPU is both safer and
+# not slower in practice. `BDS_FFT_DEVICE=cuda` restores the old behaviour.
+_FFT_DEVICE = os.environ.get("BDS_FFT_DEVICE", "cpu")
+
+
 def _build_fft_processor() -> TrajectoryFFTProcessor:
     config = TrajectoryFFTConfig(
         norm="ortho",
@@ -26,7 +37,7 @@ def _build_fft_processor() -> TrajectoryFFTProcessor:
         use_sliding_window=False,
         store_dtype=torch.float32,
         store_complex_as_float2=True,
-        device="cuda",
+        device=_FFT_DEVICE,
     )
     return TrajectoryFFTProcessor(config)
 
@@ -47,102 +58,6 @@ def _preprocess_window(
     )  # (N, 3, T)
     coords_preprocessed_tn3 = x_proc.permute(2, 0, 1).contiguous().cpu().numpy().astype(np.float32, copy=False)
     return x_proc, coords_preprocessed_tn3, state.to_dict(store_on_cpu=True)
-
-
-def compute_windowed_rfft_positions(
-    coords_tn3: np.ndarray,
-    dt: float,
-    window_size: int = 200,
-    hop_ratio: float = 0.5,
-) -> Tuple[
-    List[List[np.ndarray]],
-    List[List[np.ndarray]],
-    List[List[np.ndarray]],
-    np.ndarray,
-    List[np.ndarray],
-    List[Dict],
-]:
-    """
-    Compute windowed FFT for each sliding window and keep positive frequencies.
-    Each window performs its own CoM removal + Kabsch alignment and uses its
-    own first frame as the reference.
-
-    Args:
-        coords_tn3: numpy array (T, N, 3)
-        window_size: window length
-        hop_ratio: hop ratio (e.g., 0.5)
-
-    Returns:
-        x_windows, y_windows, z_windows:
-            list over windows, each is a list of length N with arrays (F, 2)
-        frame0_windows:
-            numpy array (n_windows, N, 3) initial frame for each window
-        preprocessed_windows:
-            list over windows, each is (window_size, N, 3) preprocessed coords
-        preprocess_states:
-            list over windows, each is a dict for inverting preprocessing
-    """
-    coords_tn3 = np.asarray(coords_tn3, dtype=np.float32)
-    T, N, _ = coords_tn3.shape
-    hop_size = int(window_size * hop_ratio)
-    if hop_size <= 0:
-        raise ValueError(f"Invalid hop_size={hop_size}, window_size={window_size}, hop_ratio={hop_ratio}")
-    if T < window_size:
-        return [], [], [], np.empty((0, N, 3), dtype=np.float32)
-
-    x_windows: List[List[np.ndarray]] = []
-    y_windows: List[List[np.ndarray]] = []
-    z_windows: List[List[np.ndarray]] = []
-    frame0_list = []
-
-    processor = _build_fft_processor()
-    window = torch.hann_window(window_size, device="cpu", dtype=torch.float32)
-    n_windows = 1 + (T - window_size) // hop_size
-    preprocessed_windows: List[np.ndarray] = []
-    preprocess_states: List[Dict] = []
-    for w in range(n_windows):
-        start = w * hop_size
-        end = start + window_size
-        coords_window = coords_tn3[start:end]  # (window_size, N, 3)
-        x_proc, coords_preprocessed_tn3, preprocess_state = _preprocess_window(
-            processor, coords_window, dt=dt
-        )
-        preprocessed_windows.append(coords_preprocessed_tn3)
-        preprocess_states.append(preprocess_state)
-        frame0 = x_proc[:, :, 0]  # (N, 3)
-        disp = x_proc - frame0.unsqueeze(-1)  # (N, 3, T)
-        # (T, N, 3) -> (N, 3, T)
-        disp_n3t = disp.contiguous()
-
-        # STFT with Hann window + normalized=True for numerical stability
-        # disp_n3t: (N, 3, T) -> per axis: (N, T)
-        spectrum_xyz = []
-        for axis in range(3):
-            axis_series = disp_n3t[:, axis, :]  # (N, T)
-            spec = torch.stft(
-                axis_series,
-                n_fft=window_size,
-                hop_length=window_size,  # single window (no extra hops within a window)
-                win_length=window_size,
-                window=window,
-                center=False,
-                return_complex=True,
-                normalized=True,
-            )  # (N, F, 1)
-            spectrum_xyz.append(spec.squeeze(-1))  # (N, F)
-        spec = torch.stack(spectrum_xyz, dim=1)  # (N, 3, F)
-        spec_np = spec.cpu().numpy()
-        x_spec = np.stack([spec_np[:, 0, :].real, spec_np[:, 0, :].imag], axis=-1)
-        y_spec = np.stack([spec_np[:, 1, :].real, spec_np[:, 1, :].imag], axis=-1)
-        z_spec = np.stack([spec_np[:, 2, :].real, spec_np[:, 2, :].imag], axis=-1)
-
-        x_windows.append([x_spec[i].astype(np.float32, copy=False) for i in range(N)])
-        y_windows.append([y_spec[i].astype(np.float32, copy=False) for i in range(N)])
-        z_windows.append([z_spec[i].astype(np.float32, copy=False) for i in range(N)])
-        frame0_list.append(frame0.cpu().numpy().astype(np.float32, copy=False))
-
-    frame0_windows = np.stack(frame0_list, axis=0)
-    return x_windows, y_windows, z_windows, frame0_windows, preprocessed_windows, preprocess_states
 
 
 def load_xtc_trajectory(
@@ -366,7 +281,7 @@ def replace_positions_in_data_list(
     bihito_repr_dir: str,
     feature_cache_dir: str,
     dt: float,
-    use_stft: bool = False,
+
     use_fft_windows: bool = False,
     window_size: int = 200,
     hop_ratio: float = 0.5,
@@ -514,26 +429,6 @@ def replace_positions_in_data_list(
             item["positions"]["fft_window_size"] = window_size
             item["positions"]["fft_hop_ratio"] = hop_ratio
             item["positions"]["num_fft_windows"] = len(x_windows)
-        elif use_stft:
-            (
-                x_windows,
-                y_windows,
-                z_windows,
-                frame0_windows,
-                preprocessed_windows,
-                preprocess_states,
-            ) = compute_windowed_rfft_positions(coords, dt=dt, window_size=window_size, hop_ratio=hop_ratio)
-            item["positions"]["x_windows"] = x_windows
-            item["positions"]["y_windows"] = y_windows
-            item["positions"]["z_windows"] = z_windows
-            item["positions"]["x0_windows"] = [f[:, 0] for f in frame0_windows]
-            item["positions"]["y0_windows"] = [f[:, 1] for f in frame0_windows]
-            item["positions"]["z0_windows"] = [f[:, 2] for f in frame0_windows]
-            item["positions"]["coords_preprocessed_windows"] = preprocessed_windows
-            item["positions"]["preprocess_state_windows"] = preprocess_states
-            item["positions"]["window_size"] = window_size
-            item["positions"]["hop_ratio"] = hop_ratio
-            item["positions"]["num_windows"] = len(x_windows)
         else:
             (
                 x_list,
@@ -672,11 +567,6 @@ def parse_args():
         help="Print warnings for missing/mismatched files.",
     )
     parser.add_argument(
-        "--use_stft",
-        action="store_true",
-        help="Use sliding-window STFT (window_size=200, hop_ratio=0.5 by default).",
-    )
-    parser.add_argument(
         "--use_fft_windows",
         action="store_true",
         help="Use windowed full FFT spectra (no COLA; windows concatenated).",
@@ -739,7 +629,7 @@ def main():
             bihito_repr_dir=args.bihito_repr_dir,
             feature_cache_dir=args.feature_cache_dir,
             dt=dt,
-            use_stft=args.use_stft,
+
             use_fft_windows=args.use_fft_windows,
             window_size=args.window_size,
             hop_ratio=args.hop_ratio,

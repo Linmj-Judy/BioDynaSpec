@@ -1,0 +1,131 @@
+# BioDynaSpec — Python dependencies
+#
+#
+# Install order matters:
+#   1. torch (cu124 wheel)          <- must come first, other pins key off it
+#   2. everything else              <- pip install -r requirements.txt
+#   3. flash-attn                   <- needs torch present to build; see note
+#   4. fair-esm + the openfold shim <- see "fair-esm / openfold" note below
+#
+# Platform: Linux + NVIDIA GPU (tested on H100 80GB / A800), CUDA 12.4.
+
+# ---------------------------------------------------------------------------
+# Core deep-learning stack
+# ---------------------------------------------------------------------------
+torch==2.6.0                       # cu124 build; install via the index-url below
+pytorch-lightning==2.5.1.post0
+torchmetrics==1.7.1
+deepspeed==0.16.5
+accelerate==1.5.2
+
+# ---------------------------------------------------------------------------
+# Attention kernels
+# ---------------------------------------------------------------------------
+# Prebuilt wheels are usually not available; this compiles and needs a
+# CUDA-capable toolchain (see the CUDA note at the bottom). If the build is a
+# problem, BioDynaSpec degrades gracefully: src/protein_spectrum_far.py guards
+# the import and falls back to standard attention (it prints
+# "Flash Attention is not available!" and continues).
+flash-attn==2.7.2.post1
+
+# ---------------------------------------------------------------------------
+# Protein / structural-biology tooling
+# ---------------------------------------------------------------------------
+fair-esm==2.0.0                    # ESM-2 embeddings. NOTE: needs the openfold shim, see below
+biotite==1.2.0
+rdkit==2025.3.6
+MDAnalysis==2.10.0                 # trajectory I/O in runner/data_prepare/
+biotite==1.2.0
+pymatgen==2024.2.23
+protenix==1.1.0                    # vendored under src/protenix/ as well; see note
+tokenizers==0.21.1
+transformers==4.51.3
+
+# ---------------------------------------------------------------------------
+# Data / numerics
+# ---------------------------------------------------------------------------
+numpy==2.1.0
+scipy==1.17.1
+pandas==3.0.3
+scikit-learn==1.9.0
+joblib==1.5.3
+mdtraj==1.11.1        # evaluation/ ensemble metrics (PCA, W2, SASA, RMSF)
+lmdb==2.2.1
+dm-tree==0.1.10
+easydict==1.13
+
+# ---------------------------------------------------------------------------
+# Plotting (loss curves / PSD figures)
+# ---------------------------------------------------------------------------
+matplotlib==3.10.9
+seaborn==0.13.2
+tqdm==4.67.1
+
+# ---------------------------------------------------------------------------
+# Config / experiment tracking / HPO
+# ---------------------------------------------------------------------------
+PyYAML==6.0.2
+omegaconf==2.3.1
+ml-collections==1.1.0
+wandb==0.27.2                      # training logs; disable with use_wandb: false
+ray==2.51.1                        # only used by the (currently disabled) HPO path
+
+# ---------------------------------------------------------------------------
+# Misc runtime deps pulled in by vendored code
+# ---------------------------------------------------------------------------
+optree==0.17.0                     # required by src/openfold_local/utils/chunk_utils.py
+absl-py==2.3.1
+safetensors==0.5.3
+datasets==3.6.0
+einops==0.8.2
+pydantic==2.13.4
+
+# ===========================================================================
+# NOTES
+# ===========================================================================
+#
+# 1. torch must be installed from the CUDA index, not plain PyPI:
+#
+#      pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+#
+#    (plain `pip install torch==2.6.0` gives the CPU build or a different CUDA.)
+#
+# 2. fair-esm / openfold  --  IMPORTANT, do not skip
+#
+#    fair-esm's `esm.esmfold.v1` modules import the *top-level* `openfold`
+#    package. BioDynaSpec does NOT install upstream OpenFold; it vendors a copy
+#    at src/openfold_local/ (see src/openfold_local/README.md).
+#    The repository therefore ships `openfold.py` at its root: a lazy shim that
+#    aliases `openfold.*` -> `src.openfold_local.*`. It only works when the
+#    project root is on PYTHONPATH, which scripts/*.sh guarantee.
+#    If you instead `pip install openfold`, that install will conflict with the
+#    shim — remove openfold.py if you go that route.
+#
+#    src/featureextractor.py imports esm.esmfold.v1.tri_self_attn_block
+#    (TriangularSelfAttentionBlock), so this path is exercised on every run.
+#
+# 3. protenix
+#
+#    Listed because several vendored modules import it. Weights are not needed
+#    for the ATLAS trajectory pipeline (BioDynaSpec conditions on ESM-2 + the
+#    anchor structure, not on Protenix/AlphaFold3 checkpoints).
+#
+# 4. gemmi is OPTIONAL
+#
+#    runner/data_prepare/extract_frames/save_frames_to_npy_atlas.py uses it only
+#    for an optional CIF export path; the training pipeline does not need it.
+#
+# 5. torchdrug is NOT required (and not installed in the reference env).
+#
+#    It used to be a hard import in src/data/dataset_atlas.py, but it was only
+#    needed by a dead code path (`collate_fn` / `data.PackedGraph`). The
+#    DataModule actually uses `collate_fn_single`. That import has been removed,
+#    so torchdrug is no longer needed to train.
+#
+# 6. Build toolchain (only if you need to compile flash-attn / DeepSpeed ops):
+#
+#      * CUDA toolkit 12.4 (nvcc)  -- and set CUDACXX=$CUDA_HOME/bin/nvcc
+#      * GCC 13.x                   -- CUDA 12.4 rejects older GCC; this is what
+#                                      dependencies.sh step 1 builds.
+#      * cutlass (for DeepSpeed's optional kernels)
+#

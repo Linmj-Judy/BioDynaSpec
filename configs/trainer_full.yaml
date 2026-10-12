@@ -1,0 +1,101 @@
+# Full-data training run: 2 epochs on the ATLAS train split, 4-GPU DDP.
+#
+#   bash scripts/pretrain.sh --config configs/trainer_full.yaml --gpus 4 \
+#       --resume <path/to/protein_far-epoch=01-....ckpt>
+#
+# Continues from the small-set overfit checkpoint via `--resume_ckpt`. That path
+# loads WEIGHTS ONLY and starts a fresh optimizer / LR schedule (see
+# `trainer_far.py` `load_weights_only=True`), which is what we want: the overfit
+# run proved the gradient path is healthy, and this run trains for real.
+#
+# Sizing (measured ~138 s/step on one H100, batch_size 1):
+#   1500 windows / 4 ranks = 375 steps/rank/epoch  ->  750 steps for 2 epochs
+#   ~29 h wall clock, ~1.2 days.
+#
+# Memory: the train split is 29 GB. `dataset/.../shards/atlas_train_2500` is
+# pre-split into 8 shards so each rank/worker loads only its slice instead of a
+# full copy. 4 ranks x 2 workers = 8 == num_shards, so this process grid lines up
+# exactly with the shard count and nobody shares or duplicates a shard.
+
+run_name: "BioDynaSpec_full"
+base_dir: "./runs"
+seed: 42
+deterministic: false
+
+# Data -- SHARD DIRECTORIES, not the monolithic .pth files.
+# Built with: python runner/data_prepare/make_shards.py --num-shards 8
+train_path: "./dataset/fft_window2500/shards/atlas_train_2500"
+val_path: "./dataset/fft_window2500/shards/atlas_val_2500"
+bihito_repr_dir: null
+batch_size: 1
+# Must satisfy: num_workers * num_gpus == num_shards (8), otherwise the loader
+# falls back to whole-list iteration with intra-epoch skipping -- still correct,
+# just slower, because each process then holds all 8 shards.
+num_workers: 2
+
+# Model (matches paper Sec. 4.2)
+spectrum_token_dim: 1
+num_xyz_channels: 3
+use_complex_spectrum: true
+aatype_vocab_size: 21
+esm_dim: 1280
+with_irfc: true
+num_sampling_steps: '50'
+diffusion_batch_mul: 1
+dropout_rate: 0.0
+denoise_seq_chunk_size: 2560
+denoise_block_type: "residue"
+# Gradient checkpointing is required: the smoke run peaked at 80.7/80 GB VRAM.
+denoise_use_checkpoint: true
+use_checkpoint: true
+max_spectrum_len: 2560
+
+# Diffusion
+learn_sigma: false
+predict_xstart: true   # START_X: network regresses x_0 directly (paper Eq. diff-loss)
+sigma_small: false
+noise_schedule: 'cosine'
+use_kl: false
+rescale_learned_sigmas: false
+diffusion_steps: 1000
+
+# Training -- 2 epochs, per the user's call that 2 is enough.
+max_epochs: 2
+lr: 0.0001
+warmup_epochs: 1
+min_lr: 0.000001
+warmup_start_lr: 0.0000001
+plateau_patience: 8
+plateau_factor: 0.7
+beta: 0.000001
+
+# Trainer -- 4-GPU DDP.
+devices: 4
+sync_batchnorm: true
+precision: 'bf16'
+gradient_clip_val: 1.0
+accumulate_grad_batches: 1
+log_every_n_steps: 1
+reload_dataloaders_every_n_epochs: 0
+num_sanity_val_steps: 0
+check_val_every_n_epoch: 1
+limit_val_batches: 1.0
+limit_train_batches: 1.0
+find_unused_parameters: true
+
+# Checkpoints. Each ckpt is ~6.4 GB, so save every 32 steps rather than every
+# step (2 epochs x 375 steps/rank / 32 ~= 24 writes per rank).
+save_top_k: 1
+monitor_metric: 'train_loss'
+monitor_mode: 'min'
+checkpoint_interval: 1
+save_every_n_steps: 32
+
+use_wandb: false
+wandb_project: "BioMacroDynamicsFAR"
+
+use_dataset_subsample: false
+subsample_ratio: 0.1
+
+use_self_forcing: false
+enable_spectrum_chunk_loss: true

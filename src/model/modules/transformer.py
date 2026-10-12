@@ -281,8 +281,9 @@ class AttentionPairBiasWithIRFC(nn.Module):
         self.linear_nobias_z = LinearNoBias(in_features=c_z, out_features=n_heads)
 
         # 新增：IRFC 衰减核参数 (每个头独立)
-        # 初始化为 -2.0 (exp后约为0.13)，让模型初始时具有较广的感受野
-        self.irfc_log_gamma = nn.Parameter(torch.full((n_heads,), -2.0))
+        # 论文 Eq.(9): tau_h = softplus(gamma_h)，gamma_h 初始化为 -2.0。
+        # 用 softplus 而非 exp 以保证非负。
+        self.irfc_gamma = nn.Parameter(torch.full((n_heads,), -2.0))
 
     def glorot_init(self):
         nn.init.xavier_uniform_(self.attention.linear_q.weight)
@@ -347,7 +348,7 @@ class AttentionPairBiasWithIRFC(nn.Module):
             # 确保 dtype / device 与 bias 一致，避免运行时内部解析异常
             irfc_dist_sq = irfc_dist_sq.to(dtype=bias.dtype, device=bias.device)
             # gamma: [n_heads] -> 调整维度以便广播
-            gamma = torch.exp(self.irfc_log_gamma).view(1, 1, 1, 1, self.n_heads)
+            gamma = F.softplus(self.irfc_gamma).view(1, 1, 1, 1, self.n_heads)
 
             # 计算局部衰减偏置
             # [..., n_blocks, n_queries, n_keys, 1] * [1, 1, 1, 1, n_heads]
@@ -416,7 +417,7 @@ class AttentionPairBiasWithIRFC(nn.Module):
             # gamma = exp(log_gamma), 确保衰减系数为正
             # 适配 batch/seq_len 维度：对 bias 前缀维度全部广播
             head_shape = [1] * (bias.dim() - 3) + [self.n_heads, 1, 1]
-            gamma = torch.exp(self.irfc_log_gamma).view(*head_shape)
+            gamma = F.softplus(self.irfc_gamma).view(*head_shape)
             # 计算衰减核: -gamma * distance^2
             irfc_bias = -gamma * irfc_dist_sq.unsqueeze(-3)
             bias = bias + irfc_bias

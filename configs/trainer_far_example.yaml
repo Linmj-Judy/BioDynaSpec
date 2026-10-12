@@ -32,7 +32,7 @@ max_spectrum_len: 2560
 
 # Diffusion loss parameters
 learn_sigma: false
-predict_xstart: false
+predict_xstart: true   # START_X: network regresses x_0 directly (paper Eq. diff-loss; matches reference trainer)
 sigma_small: false
 noise_schedule: 'cosine'
 use_kl: false

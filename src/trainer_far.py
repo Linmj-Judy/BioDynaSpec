@@ -10,21 +10,9 @@ from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.plugins.environments import LightningEnvironment
 from pytorch_lightning.loggers import WandbLogger
-from torch.utils.data import DataLoader
-import torch.nn.functional as F
 import random
 import numpy as np
-import math
 from typing import Dict, Any, Optional
-# Ray Tune imports
-from ray import tune, train
-from ray.tune import CLIReporter
-from ray.tune.schedulers import ASHAScheduler
-from ray.tune.integration.pytorch_lightning import TuneReportCheckpointCallback
-from ray.train import ScalingConfig
-from ray.train.lightning import RayDDPStrategy
-from ray.train.lightning import RayLightningEnvironment
-from ray.train.lightning import prepare_trainer
 
 from main_model import ProteinDynamicsFAR
 from data.datamodule import DataModule
@@ -45,7 +33,14 @@ class SpectrumLossWeight:
         self.log_spectral_l1_loss = 10.0
         self.cosine_similarity_loss = 5.0
         self.spectral_convergence_loss = 5.0
-        self.amplitude_mse_loss = 5.0
+        # 5.0 -> 2.0. The term is now scale-normalised
+        # (`_compute_relative_amplitude_mse_loss`), which changes its magnitude
+        # by 1/mean(A_true^2) ≈ 7.2x on ATLAS data, so the old weight no longer
+        # means what it did. 2.0 matches the successor project
+        # (MacroMolecularDynamics configs/configs_base.py) and keeps the
+        # amplitude term from dominating the summed loss in the large-error
+        # regime.
+        self.amplitude_mse_loss = 2.0
 
 
 class SpectrumLossConfig:
@@ -78,14 +73,20 @@ class BaseConfig:
     aatype_vocab_size = 21
     esm_dim = 1280
     with_irfc=True
-    # encoder_depth = 4
-    # encoder_num_heads = 8
-    # decoder_embed_dim = 512
-    # decoder_depth = 4
-    # decoder_num_heads = 8
-    # buffer_size = 32
-    # diffloss_d = 2
-    # diffloss_w = 512
+    # Architecture knobs consumed unconditionally by main_model.py:164-171.
+    # These MUST have defaults here: create_config() only overlays keys that the
+    # YAML/tune actually provide, and both the shipped YAML and BaseConfig had
+    # these commented out -> `ProteinDynamicsFAR(cfg)` raised AttributeError, so
+    # the documented `bash scripts/pretrain.sh` path could not start at all.
+    # Values mirror protein_spectrum_far_base() (paper: d_model=768, 12 heads).
+    encoder_depth = 12
+    encoder_num_heads = 16
+    decoder_embed_dim = 768
+    decoder_depth = 12
+    decoder_num_heads = 12
+    buffer_size = 32
+    diffloss_d = 3
+    diffloss_w = 1024
     num_sampling_steps = '50'
     diffusion_batch_mul = 1
     dropout_rate = 0.0
@@ -97,7 +98,7 @@ class BaseConfig:
 
     # diffusion loss parameters with safe defaults
     learn_sigma = False
-    predict_xstart = False
+    predict_xstart = True
     sigma_small = False
     noise_schedule = 'cosine'
     use_kl = False
@@ -115,9 +116,8 @@ class BaseConfig:
     beta = 1e-6
     
     # Trainer configuration
-    using_ray = False
     # devices = -1  # 一般：使用所有可用GPU
-    devices = "auto"  # Ray Tune自动配置
+    devices = "auto"
     sync_batchnorm = True
 
     precision = 'bf16'
@@ -131,6 +131,7 @@ class BaseConfig:
     num_sanity_val_steps = 0
     check_val_every_n_epoch = 1
     limit_val_batches = 1.0
+    limit_train_batches = 1.0  # set <1.0 to bound a smoke run
     find_unused_parameters = True
     
     # 检查点相关
@@ -199,81 +200,33 @@ def load_config_from_yaml(yaml_path: str) -> Dict[str, Any]:
     return config_dict
 
 
-def create_config(tune_config: Dict[str, Any] = None, base_config: BaseConfig = None, yaml_config_path: Optional[str] = None) -> object:
+def create_config(base_config: BaseConfig = None, yaml_config_path: Optional[str] = None) -> object:
     """
-    创建配置对象，将tune_config和yaml配置的内容合并/覆盖到base_config（BaseConfig实例）中
-    
-    优先级: tune_config > yaml_config > base_config
+    创建配置对象，将yaml配置的内容合并/覆盖到base_config（BaseConfig实例）中
+
+    优先级: yaml_config > base_config
 
     Args:
-        tune_config: Ray Tune给定的超参数字典（新定义的参数），优先级最高
         base_config: 已有的BaseConfig实例，或None（此时用默认），优先级最低
-        yaml_config_path: YAML配置文件路径，优先级中等
+        yaml_config_path: YAML配置文件路径，优先级更高
 
     Returns:
-        config对象，参数为三者合并，优先级高的覆盖优先级低的
+        config对象
     """
-    # 只要 tune_config 里有的 key，就会覆盖 base_config 的原有值，这是标准写法
     if base_config is None:
         config = BaseConfig()
     else:
         import copy
         config = copy.deepcopy(base_config)
-    
-    # 首先从YAML文件加载配置（如果提供）
-    yaml_config = {}
+
+    # 从YAML文件加载配置（如果提供）
     if yaml_config_path:
         yaml_config = load_config_from_yaml(yaml_config_path)
-        # 将yaml配置应用到config对象
         for key, value in yaml_config.items():
             setattr(config, key, value)
         logging.info(f"已应用YAML配置，覆盖了 {len(yaml_config)} 个参数")
-    
-    # 然后应用tune_config（优先级最高）
-    if tune_config:
-        for key, value in tune_config.items():
-            setattr(config, key, value)
-    
+
     return config
-
-
-def get_search_space() -> Dict[str, Any]:
-    """
-    定义超参数搜索空间
-    
-    Returns:
-        搜索空间字典
-    """
-    search_space = {
-        # 学习率搜索（对数均匀采样）
-        "lr": tune.loguniform(1e-5, 1e-3),
-        
-        # 模型架构超参数
-        "encoder_depth": tune.choice([2, 4, 6]),
-        "encoder_num_heads": tune.choice([4, 8, 16]),
-        "decoder_embed_dim": tune.choice([256, 512, 768]),
-        "decoder_depth": tune.choice([2, 4, 6]),
-        "decoder_num_heads": tune.choice([4, 8, 16]),
-        
-        # Buffer size
-        "buffer_size": tune.choice([16, 32, 64]),
-        
-        # Diffloss参数
-        "diffloss_d": tune.choice([2, 4, 8]),
-        "diffloss_w": tune.choice([256, 512, 1024]),
-        
-        # 优化器参数
-        "warmup_epochs": tune.choice([5, 10, 15]),
-        "min_lr": tune.loguniform(1e-7, 1e-5),
-        "warmup_start_lr": tune.loguniform(1e-8, 1e-6),
-        "plateau_patience": tune.choice([5, 8, 10]),
-        "plateau_factor": tune.choice([0.5, 0.7, 0.9]),
-        
-        # Beta参数（KL loss权重）
-        "beta": tune.loguniform(1e-7, 1e-5),
-    }
-    
-    return search_space
 
 def get_default_hyperparameters() -> Dict[str, Any]:
     """
@@ -282,16 +235,21 @@ def get_default_hyperparameters() -> Dict[str, Any]:
     Returns:
         默认超参数字典
     """
+    # NOTE: this dict takes HIGHEST priority in create_config(), so it — not
+    # BaseConfig — determines the architecture that `pretrain.sh` actually
+    # trains. It previously held a small debug config (4/8/512/4/8/2/512, 158M
+    # params) which silently disagreed with paper Sec. 4.2 (d_model=768,
+    # 12 heads). Values below mirror protein_spectrum_far_base() and the paper.
     return {
         "lr": 1e-4,
-        "encoder_depth": 4,
-        "encoder_num_heads": 8,
-        "decoder_embed_dim": 512,
-        "decoder_depth": 4,
-        "decoder_num_heads": 8,
+        "encoder_depth": 12,
+        "encoder_num_heads": 16,
+        "decoder_embed_dim": 768,
+        "decoder_depth": 12,
+        "decoder_num_heads": 12,
         "buffer_size": 32,
-        "diffloss_d": 2,
-        "diffloss_w": 512,
+        "diffloss_d": 3,
+        "diffloss_w": 1024,
         "warmup_epochs": 10,
         "min_lr": 1e-6,
         "warmup_start_lr": 1e-7,
@@ -347,31 +305,11 @@ class FARTrainer:
         # 配置精度
         self.config_precision()
 
-        # 尝试获取 Ray Train 上下文，如果失败则说明不在 Ray 环境中
-        self.in_ray_context = False
-        if self.config.using_ray:
-            try:
-                ctx = train.get_context()
-                self.in_ray_context = True
-                # [2] Configure scaling and resource requirements.
-                self.scaling_config = ScalingConfig(num_workers=torch.cuda.device_count(), use_gpu=self.use_cuda)
-                self.trial_id = str(ctx.get_trial_id()) if ctx else "local"
-                logging.info(f"检测到 Ray Train 环境，Trial ID: {self.trial_id}")
-            except RuntimeError as e:
-                # 不在 Ray Train 环境中
-                logging.warning(f"未检测到 Ray Train 环境 ({e})，使用本地模式")
-                self.in_ray_context = False
-                self.scaling_config = None
-                self.trial_id = "no_tune"
-        else:
-            self.scaling_config = None
-            self.trial_id = "no_tune"
 
-    
     def init_basics(self):
         """初始化基础配置"""
         self.run_name = self.config.run_name + "_" + time.strftime("%Y%m%d_%H%M%S")
-        self.run_dir = os.path.join(self.config.base_dir, self.run_name, f"trial_{self.trial_id}") if self.trial_id != "no_tune" else os.path.join(self.config.base_dir, self.run_name)
+        self.run_dir = os.path.join(self.config.base_dir, self.run_name)
         self.checkpoint_dir = os.path.join(self.run_dir, "checkpoints")
         self.wandb_dir = os.path.join(self.run_dir, "wandb")
         
@@ -450,43 +388,54 @@ class FARTrainer:
         else:
             ckpt_kwargs["every_n_epochs"] = self.config.checkpoint_interval
         self.checkpoint_callback = SafeModelCheckpoint(**ckpt_kwargs)
-        self.ray_tune_callback = TuneReportCheckpointCallback(
-            metrics={
-                "train_loss": "train_loss_epoch",      # ✓ 存在
-                "val_loss": "val_loss_epoch",          # ✓ 存在
-                "train_diffloss": "train_diffloss_epoch",  # ✓ 存在
-                "val_diffloss": "val_diffloss_epoch",      # ✓ 存在
-                # "train_recon_loss": "train_recon_loss_epoch",  # ✗ 已注释，不报告
-                # "val_recon_loss": "val_recon_loss_epoch",      # ✗ 已注释，不报告
-            },
-            save_checkpoints=False,
-            on="validation_end"
-        )
 
         self.callbacks = [self.checkpoint_callback]
-        
+
         # 学习率监控回调（用于wandb记录）
         if self.config.use_wandb:
             lr_monitor = LearningRateMonitor(logging_interval='step')
             self.callbacks.append(lr_monitor)
 
-        # ✅ 只在 Ray Tune 环境中添加 TuneReportCheckpointCallback
-        if self.in_ray_context:
-            # 必须放在最后，确保它能获取到所有指标
-            self.callbacks.append(self.ray_tune_callback)
-            logging.info("已添加 TuneReportCheckpointCallback（Ray Tune 模式）")
-        else:
-            logging.info("跳过 TuneReportCheckpointCallback（本地训练模式）")
-    
+    @staticmethod
+    def _resolve_device_count(devices, accelerator: str) -> int:
+        """Number of devices PL will actually use, derived from `config.devices`.
+
+        The strategy choice must follow the config, not the machine's raw GPU
+        count — otherwise `devices: 1` on a multi-GPU node silently builds a
+        DDPStrategy. Mirrors the forms Lightning accepts: an int, -1 (all),
+        "auto"/None, or an explicit list of indices.
+        """
+        if accelerator != "gpu":
+            n = devices
+            if isinstance(n, (list, tuple)):
+                return max(1, len(n))
+            if n in (None, "auto", -1):
+                return 1
+            try:
+                return max(1, int(n))
+            except (TypeError, ValueError):
+                return 1
+
+        if isinstance(devices, (list, tuple)):
+            return max(1, len(devices))
+        if devices in (None, "auto", -1):
+            return max(1, torch.cuda.device_count())
+        try:
+            return max(1, int(devices))
+        except (TypeError, ValueError):
+            # Unrecognised value: let Lightning interpret it.
+            return max(1, torch.cuda.device_count())
+
     def init_trainer(self):
         """初始化PyTorch Lightning Trainer"""
         logging.info("Initializing Trainer...")
-        
-        # 配置策略 - 根据实际的 Ray 上下文状态而不是配置值
-        if self.in_ray_context and torch.cuda.device_count() > 1:
-            strategy = RayDDPStrategy()
-            logging.info("使用 RayDDPStrategy")
-        elif torch.cuda.device_count() > 1:
+
+        accelerator = 'gpu' if self.use_cuda else 'cpu'
+        n_devices = self._resolve_device_count(self.config.devices, accelerator)
+        logging.info(f"devices={self.config.devices!r} -> {n_devices} device(s)")
+
+        # 配置策略 - 由 config.devices 决定，而不是机器上的 GPU 数量
+        if n_devices > 1:
             # When find_unused_parameters=True, static_graph must be False,
             # otherwise DDP will still error on unused params.
             use_ckpt = bool(getattr(self.config, "use_checkpoint", False) or getattr(self.config, "denoise_use_checkpoint", False))
@@ -495,16 +444,16 @@ class FARTrainer:
             logging.info("使用 DDPStrategy")
         else:
             strategy = "auto"
-            logging.info("使用 auto strategy")
-        
+            logging.info("使用 auto strategy（单卡）")
+
         self.trainer = pl.Trainer(
-            accelerator='gpu' if self.use_cuda else 'cpu',
+            accelerator=accelerator,
             devices=self.config.devices,
             strategy=strategy,
             max_epochs=self.config.max_epochs,
             callbacks=self.callbacks,
-            plugins=[RayLightningEnvironment()] if self.in_ray_context else [LightningEnvironment()],
-            enable_checkpointing=False if self.in_ray_context else True,
+            plugins=[LightningEnvironment()],
+            enable_checkpointing=True,
             logger=self.logger,  # WandB logger
             precision=self.config.precision,
             gradient_clip_val=self.config.gradient_clip_val,
@@ -516,16 +465,12 @@ class FARTrainer:
             num_sanity_val_steps=self.config.num_sanity_val_steps,
             check_val_every_n_epoch=self.config.check_val_every_n_epoch,
             limit_val_batches=self.config.limit_val_batches,
+            limit_train_batches=getattr(self.config, "limit_train_batches", 1.0),
             reload_dataloaders_every_n_epochs=getattr(self.config, 'reload_dataloaders_every_n_epochs', 0),
             deterministic=self.config.deterministic
         )
-        
-        # 只有在真正的 Ray 环境中才调用 prepare_trainer
-        if self.in_ray_context:
-            self.trainer = prepare_trainer(self.trainer)
-            logging.info("Trainer 已通过 Ray prepare_trainer 准备")
-            
-    
+
+
     def seed_everything(self, seed: int = 42):
         """Setting all random seeds"""
         random.seed(seed)
@@ -585,162 +530,35 @@ class FARTrainer:
             self.trainer.save_checkpoint(final_ckpt)
             logging.info(f"训练完成！最终模型已保存至: {final_ckpt}")
 
-    # def run_raytune(self):
-    #     trainer = TorchTrainer(
-    #         self.run,
-    #         scaling_config=self.scaling_config,
-    #         train_loop_config=self
-    #         # [3a] If running in a multi-node cluster, this is where you
-    #         # should configure the run's persistent storage that is accessible
-    #         # across all worker nodes.
-    #         # run_config=ray.train.RunConfig(storage_path="s3://..."),
-    #     )
-    #     result: ray.train.Result = trainer.fit()
+def train_single_config(yaml_config_path: Optional[str] = None):
+    """
+    用一份配置跑一次训练（论文的默认入口）。
 
-def raytune_entrypoint(tune_config: Dict[str, Any], yaml_config_path: Optional[str] = None) -> object:
-    """
-    Ray Tune入口函数，用于训练
-    
     Args:
-        tune_config: Ray Tune给定的超参数字典
-        yaml_config_path: YAML配置文件路径（可选）
-        
-    Returns:
-        None
+        yaml_config_path: YAML配置文件路径（可选），其键覆盖 BaseConfig。
     """
-    config = create_config(tune_config, BaseConfig(), yaml_config_path=yaml_config_path)
+    print("\n" + "="*80)
+    print("Training (single config)")
+    print("="*80 + "\n")
+
+    # get_default_hyperparameters() takes priority over BaseConfig in
+    # create_config(), so it — not BaseConfig — determines the architecture.
+    config = create_config(
+        BaseConfig(), yaml_config_path=yaml_config_path
+    )
+    for key, value in get_default_hyperparameters().items():
+        setattr(config, key, value)
+
     logging.info("=" * 80)
     logging.info("Training Configuration:")
     for key, value in vars(config).items():
         if not key.startswith('_'):
             logging.info(f"  {key}: {value}")
     logging.info("=" * 80)
-    trainer = FARTrainer(config)
-    trainer.run()
 
-def run_hyperparameter_optimization(
-    num_samples: int = 10,
-    num_epochs: int = 50,
-    gpus_per_trial: int = 1,
-    cpus_per_trial: int = 4,
-    max_concurrent_trials: int = 4,
-    grace_period: int = 10,
-    reduction_factor: int = 2,
-    use_asha: bool = True,
-    yaml_config_path: Optional[str] = None,
-):
-    """
-    运行超参数优化
-    
-    Args:
-        num_samples: 采样的超参数组合数量
-        num_epochs: 每个trial的最大训练epoch数
-        gpus_per_trial: 每个trial使用的GPU数量
-        cpus_per_trial: 每个trial使用的CPU数量
-        max_concurrent_trials: 最大并发trial数量
-        grace_period: ASHA调度器的grace period
-        reduction_factor: ASHA调度器的reduction factor
-        use_asha: 是否使用ASHA调度器
-        yaml_config_path: YAML配置文件路径（可选）
-    """
-    # 更新BaseConfig中的max_epochs
-    BaseConfig.max_epochs = num_epochs
-    
-    search_space = get_search_space() # Dict
-    
-    if use_asha:
-        scheduler = ASHAScheduler(
-            max_t=num_epochs,
-            grace_period=grace_period,
-            reduction_factor=reduction_factor
-        )
-    else:
-        scheduler = None
-    
-    # 创建一个包装函数，将yaml_config_path传递给raytune_entrypoint
-    def train_fn_with_yaml(tune_config):
-        return raytune_entrypoint(tune_config, yaml_config_path=yaml_config_path)
-    
-    train_fn_with_resources = tune.with_resources(
-        train_fn_with_yaml,
-        resources={"CPU": cpus_per_trial, "GPU": gpus_per_trial}
-    )
-    
-    reporter = CLIReporter(
-        parameter_columns=[
-            "lr", 
-            "encoder_depth", 
-            "decoder_embed_dim",
-            "buffer_size",
-            "diffloss_w"
-        ],
-        metric_columns=[
-            "train_loss", 
-            "val_loss", 
-            "training_iteration"
-        ],
-    )
-    
-    # 创建Tuner
-    tuner = tune.Tuner(
-        train_fn_with_resources,
-        param_space=search_space,
-        tune_config=tune.TuneConfig(
-            metric="val_loss",
-            mode="min",
-            num_samples=num_samples,
-            scheduler=scheduler,
-            max_concurrent_trials=max_concurrent_trials,
-        ),
-        run_config=tune.RunConfig(
-            name=BaseConfig.run_name,
-            storage_path=BaseConfig.base_dir,
-            checkpoint_config=tune.CheckpointConfig(
-                num_to_keep=BaseConfig.save_top_k,
-                checkpoint_score_attribute="val_loss",
-                checkpoint_score_order="min",
-            ),
-            progress_reporter=reporter,
-            verbose=1,
-        ),
-    )
-    
-    results = tuner.fit()
-    
-    best_result = results.get_best_result(metric="val_loss", mode="min")
-    
-    print("\n" + "="*80)
-    print("超参数优化完成!")
-    print("="*80)
-    print(f"\n最佳超参数配置:")
-    for key, value in best_result.config.items():
-        print(f"  {key}: {value}")
-    
-    print(f"\n最佳验证损失: {best_result.metrics['val_loss']:.6f}")
-    print(f"最佳检查点路径: {best_result.checkpoint}")
-    print("="*80 + "\n")
-    
-    return results, best_result
+    FARTrainer(config).run()
 
-def test_single_config(yaml_config_path: Optional[str] = None):
-    """
-    测试单个配置（不进行超参数搜索）
-    用于调试和验证训练流程
-    
-    Args:
-        yaml_config_path: YAML配置文件路径（可选）
-    """
-    print("\n" + "="*80)
-    print("测试单个配置（不进行超参数搜索）")
-    print("="*80 + "\n")
-    
-    test_config = get_default_hyperparameters()
-    # 在 test 模式下关闭 Ray，使用本地训练模式
-    test_config['using_ray'] = False
-    
-    raytune_entrypoint(test_config, yaml_config_path=yaml_config_path)
-    
-    print("\n单配置测试完成!\n")
+    print("\nTraining finished.\n")
 
 
 def main():
@@ -755,74 +573,29 @@ def main():
     
     import argparse
     
-    parser = argparse.ArgumentParser(description="Ray Tune超参数优化 - FAR蛋白质动力学模型")
-    parser.add_argument("--mode", type=str, default="tune", choices=["tune", "test"],
-                        help="运行模式: 'tune'进行超参数搜索, 'test'测试单个配置")
-    parser.add_argument("--num_samples", type=int, default=10,
-                        help="超参数采样数量")
-    parser.add_argument("--num_epochs", type=int, default=50,
-                        help="每个trial的最大训练epoch数")
-    parser.add_argument("--gpus_per_trial", type=int, default=1,
-                        help="每个trial使用的GPU数量")
-    parser.add_argument("--cpus_per_trial", type=int, default=4,
-                        help="每个trial使用的CPU数量")
-    parser.add_argument("--max_concurrent_trials", type=int, default=4,
-                        help="最大并发trial数量")
-    parser.add_argument("--grace_period", type=int, default=10,
-                        help="ASHA调度器的grace period")
-    parser.add_argument("--reduction_factor", type=int, default=2,
-                        help="ASHA调度器的reduction factor")
-    parser.add_argument("--no_asha", action="store_true",
-                        help="禁用ASHA调度器")
+    parser = argparse.ArgumentParser(
+        description="BioDynaSpec training - FAR protein dynamics model"
+    )
+    parser.add_argument("--config", type=str, default=None,
+                        help="YAML config path (optional); its keys override BaseConfig")
     # 断点续训与WandB恢复
     parser.add_argument("--resume_ckpt", type=str, default=None,
-                        help="从指定checkpoint路径继续训练 (.ckpt)")
+                        help="Resume from this checkpoint (.ckpt)")
     parser.add_argument("--wandb_id", type=str, default=None,
-                        help="恢复到同一个WandB run的ID（可选）")
-    parser.add_argument("--config", type=str, default=None,
-                        help="YAML配置文件路径（可选），配置文件中的参数会覆盖BaseConfig中的默认值")
-    
+                        help="Resume logging into this existing WandB run id (optional)")
+
     args = parser.parse_args()
 
     os.makedirs(BaseConfig.base_dir, exist_ok=True)
-    
+
     # 将命令行断点续训参数注入配置
     if args.resume_ckpt is not None and len(args.resume_ckpt) > 0:
         BaseConfig.load_checkpoint_path = args.resume_ckpt
     if args.wandb_id is not None and len(args.wandb_id) > 0:
         BaseConfig.wandb_id = args.wandb_id
 
-    if args.mode == "test":
-        # 测试模式：运行单个配置
-        test_single_config(yaml_config_path=args.config)
-    else:
-        # 超参数优化模式
-        results, best_result = run_hyperparameter_optimization(
-            num_samples=args.num_samples,
-            num_epochs=args.num_epochs,
-            gpus_per_trial=args.gpus_per_trial,
-            cpus_per_trial=args.cpus_per_trial,
-            max_concurrent_trials=args.max_concurrent_trials,
-            grace_period=args.grace_period,
-            reduction_factor=args.reduction_factor,
-            use_asha=not args.no_asha,
-            yaml_config_path=args.config,
-        )
-        
-        # 保存最佳配置
-        best_config_path = os.path.join(BaseConfig.base_dir, BaseConfig.run_name, "best_config.txt")
-        with open(best_config_path, 'w') as f:
-            f.write("最佳超参数配置:\n")
-            f.write("="*80 + "\n")
-            for key, value in best_result.config.items():
-                f.write(f"{key}: {value}\n")
-            f.write("\n")
-            f.write(f"最佳验证损失: {best_result.metrics['val_loss']:.6f}\n")
-            f.write(f"最佳检查点: {best_result.checkpoint}\n")
-        
-        print(f"\n最佳配置已保存到: {best_config_path}")
+    train_single_config(yaml_config_path=args.config)
 
 
 if __name__ == "__main__":
     main()
-

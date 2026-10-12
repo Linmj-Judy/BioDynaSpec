@@ -149,14 +149,32 @@ class SpectrumDiffLoss(nn.Module):
         def denoised_fn(x):
             # return torch.clamp(x, min=-2.0, max=2.0)
             return x
-        
-        sampled_spectrum, pred_start_spectrum = self.gen_diffusion.p_sample_loop(
-            sample_fn, noise.shape, noise, 
+
+        # DDIM sampler, as described in the paper (Sec. 4.2): 50 respaced steps
+        # via Denoising Diffusion Implicit Models. We use eta=0, i.e. the
+        # deterministic DDIM update.
+        #
+        # NOTE: DDIM has no temperature knob. p_sample_loop() used to scale the
+        # injected noise by `temperature`, but that path is ancestral sampling
+        # and does not match the paper. temperature is therefore only applied
+        # when it differs from the default, as stochasticity (eta) — a
+        # temperature < 1 is not representable without changing the sampler, so
+        # we guard against silently ignoring it.
+        eta = 0.0
+        if temperature != 1.0:
+            raise ValueError(
+                "The DDIM sampler (paper Sec. 4.2) is deterministic and does not "
+                f"support temperature != 1.0 (got {temperature}). "
+                "Use eta>0 in ddim_sample if stochastic DDIM is intended."
+            )
+
+        sampled_spectrum, pred_start_spectrum = self.gen_diffusion.ddim_sample_loop(
+            sample_fn, noise.shape, noise,
             clip_denoised=False,  # Don't use built-in [-1,1] clipping
             denoised_fn=denoised_fn,  # Use custom clipping range
-            model_kwargs=model_kwargs, 
+            model_kwargs=model_kwargs,
             progress=False,
-            temperature=temperature
+            eta=eta,
         )
 
         return sampled_spectrum, pred_start_spectrum

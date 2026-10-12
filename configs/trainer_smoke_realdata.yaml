@@ -1,0 +1,97 @@
+# Minimal smoke-test config: runs the real BioDynaSpec trainer for a couple of
+# steps on the ATLAS fft_window2500 test split. Intended to verify the training
+# pipeline end-to-end, NOT to produce a usable model.
+#
+#   bash scripts/pretrain.sh --config configs/trainer_smoke.yaml
+#
+# Uses the REAL train/val splits (they are now fully downloaded), so the
+# reported loss is measured on the data the paper trains on -- not on the test
+# split, which was only a stand-in while train/val were still uploading.
+
+run_name: "BioDynaSpec_smoke_realdata"
+base_dir: "./runs"
+seed: 42
+deterministic: false
+
+# Data
+train_path: "./dataset/fft_window2500/atlas_10_features_fouriered_list_train_normalized.pth"
+val_path: "./dataset/fft_window2500/atlas_10_features_fouriered_list_val_normalized.pth"
+bihito_repr_dir: null
+batch_size: 1
+# Keep at 0 for smoke runs. Loading the split costs ~9 min here and peak RSS
+# tracks the file size (~30 GB for train), and the DataLoader workers do not
+# make it cheaper. `torch.load(mmap=True)` was measured NOT to help: the payload
+# is nested numpy arrays, which pickle materialises regardless of mmap.
+num_workers: 0
+
+# Model (matches paper Sec. 4.2)
+spectrum_token_dim: 1
+num_xyz_channels: 3
+use_complex_spectrum: true
+aatype_vocab_size: 21
+esm_dim: 1280
+with_irfc: true
+num_sampling_steps: '50'
+diffusion_batch_mul: 1
+dropout_rate: 0.0
+denoise_seq_chunk_size: 2560
+denoise_block_type: "residue"
+denoise_use_checkpoint: true
+use_checkpoint: true
+max_spectrum_len: 2560
+
+# Diffusion
+learn_sigma: false
+predict_xstart: true   # START_X: network regresses x_0 directly (paper Eq. diff-loss; matches reference trainer)
+sigma_small: false
+noise_schedule: 'cosine'
+use_kl: false
+rescale_learned_sigmas: false
+diffusion_steps: 1000
+
+# Training: keep tiny
+max_epochs: 1
+lr: 0.0001
+warmup_epochs: 1
+min_lr: 0.000001
+warmup_start_lr: 0.0000001
+plateau_patience: 8
+plateau_factor: 0.7
+beta: 0.000001
+
+# Trainer. `devices` is authoritative: DDP is selected iff the resolved device
+# count > 1, so devices: 1 gives a single-process run even on a 4-GPU node.
+# Use 4 for the multi-GPU path, or -1 / "auto" for every visible GPU.
+using_ray: false
+devices: 1
+sync_batchnorm: true
+precision: 'bf16'
+gradient_clip_val: 1.0
+accumulate_grad_batches: 1
+log_every_n_steps: 1
+reload_dataloaders_every_n_epochs: 0
+num_sanity_val_steps: 0
+check_val_every_n_epoch: 1
+limit_val_batches: 1
+# Bound the smoke run: the full train split is 1500 windows at ~2 min/step.
+# Set to 1.0 for a real run.
+limit_train_batches: 3
+find_unused_parameters: true
+
+# Checkpoints
+save_top_k: 1
+monitor_metric: 'train_loss'
+monitor_mode: 'min'
+checkpoint_interval: 1
+save_every_n_steps: 1
+
+# Disable wandb for smoke runs
+use_wandb: false
+wandb_project: "BioMacroDynamicsFAR"
+
+# No subsampling: iterate the (small) test split
+use_dataset_subsample: false
+subsample_ratio: 0.1
+
+use_self_forcing: false
+enable_spectrum_chunk_loss: true

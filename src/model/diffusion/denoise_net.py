@@ -8,7 +8,6 @@ import warnings
 from typing import Optional
 from typing import List
 from functools import partial
-from src.model.modules.attention import Mlp
 from src.openfold_local.utils.chunk_utils import chunk_layer
 from src.openfold_local.model.primitives import LayerNorm
 from src.openfold_local.model.primitives import Attention as OpenFoldAttention
@@ -886,16 +885,20 @@ class FrequencyComponentDenoiseNet(nn.Module):
 
         self.input_proj = nn.Linear(in_channels, model_channels)
 
-        res_blocks = []
         if block_type not in ("residue", "mlp"):
             raise ValueError(f"Unsupported block_type={block_type}, expected 'residue' or 'mlp'")
+        res_blocks = []
         for _ in range(num_dit_blocks):
-            # if block_type == "residue":
-            #     res_blocks.append(ResidueDiTBlock(
-            #         model_channels, num_heads, mlp_ratio=mlp_ratio
-            #     ))
-            # else:
-            res_blocks.append(ResBlock(model_channels))
+            if block_type == "residue":
+                # Self-attention along the residue axis, so conditioning from one
+                # residue can reach the others. This is the "residue" half of the
+                # hybrid spatio-spectral design; without it the denoiser is a
+                # per-token MLP and residues never exchange information.
+                res_blocks.append(
+                    ResidueDiTBlock(model_channels, num_heads, mlp_ratio=mlp_ratio)
+                )
+            else:
+                res_blocks.append(ResBlock(model_channels))
 
         self.res_blocks = nn.ModuleList(res_blocks)
         self.final_layer = FinalLayer(model_channels, out_channels)

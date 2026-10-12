@@ -33,7 +33,7 @@ max_spectrum_len: 2560
 
 # Diffusion loss parameters
 learn_sigma: false
-predict_xstart: false
+predict_xstart: true   # START_X: network regresses x_0 directly (paper Eq. diff-loss; matches reference trainer)
 sigma_small: false
 noise_schedule: 'cosine'
 use_kl: false
@@ -41,9 +41,13 @@ rescale_learned_sigmas: false
 diffusion_steps: 1000
 
 # 训练相关
-max_epochs: 50
+max_epochs: 2
 lr: 0.0001
-warmup_epochs: 10
+# NOTE: must stay < max_epochs. The scheduler is linear-warmup while
+# `last_epoch < warmup_epochs` and only cosine-anneals after that, so a
+# warmup_epochs >= max_epochs run never leaves the ramp: at max_epochs=2 with
+# warmup_epochs=10 the LR tops out near 1e-5 instead of the intended 1e-4.
+warmup_epochs: 1
 min_lr: 0.000001
 warmup_start_lr: 0.0000001
 plateau_patience: 8

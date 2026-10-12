@@ -28,12 +28,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as ckpt
-from openfold.model.primitives import Linear, LayerNorm
-from openfold.utils.rigid_utils import Rigid, Rotation
-from openfold.model.structure_module import InvariantPointAttention
+from openfold_local.model.primitives import Linear, LayerNorm
+from openfold_local.utils.rigid_utils import Rigid, Rotation
+from openfold_local.model.structure_module import InvariantPointAttention
 
 # from timm.models.vision_transformer import Block
-from typing import Optional, Tuple
+from typing import Optional
 
 from featureextractor import FeatureExtractor
 from model.diffloss import SpectrumDiffLoss
@@ -47,7 +47,7 @@ from model.modules.primitives import Attention as OpenFoldAttention
 # FlashAttention availability
 # ============================================================================
 try:
-    from flash_attn import flash_attn_func, flash_attn_qkvpacked_func  # noqa: F401
+    from flash_attn import flash_attn_qkvpacked_func  # noqa: F401
     try:
         from flash_attn import flash_attn_with_kvcache  # noqa: F401
         _flash_attn_with_kvcache_available = True
@@ -150,32 +150,34 @@ class Attention(nn.Module):
 
     def forward(self, x: torch.Tensor, *, kv_cache: dict | None = None, causal: bool = False) -> torch.Tensor:
         """
-        No batch size:
-        x: (N, C)
-        Output: (N, C)
-        kv_cache: optional dict with keys {"k_cache", "v_cache", "cache_seqlens", "cache_batch_idx"}
+        Accepts (N, C) or (B, N, C). Attention always runs within one batch
+        element (i.e. within a single residue's frequency axis, or within a
+        single frequency's residue axis) — see HybridBlock.
+
+        x: (N, C) or (B, N, C)
+        Output: same shape as input
         causal: whether to apply causal masking
         """
-        N, C = x.shape
-        # B=1 for no-batch mode
-        x_1b = x.unsqueeze(0)  # (1, N, C)
-        qkv_linear = self.qkv(x_1b)  # (1, N, 3*C)
+        squeeze = x.dim() == 2
+        x_1b = x.unsqueeze(0) if squeeze else x  # (B, N, C)
+        B, N, C = x_1b.shape
+        qkv_linear = self.qkv(x_1b)  # (B, N, 3*C)
 
         if _flash_attn_available:
             orig_dtype = qkv_linear.dtype
             if orig_dtype not in (torch.bfloat16, torch.float16):
                 print(f"Flash Attention QKV linear dtype must be bfloat16 or float16, but got {orig_dtype}, turning to bfloat16")
                 qkv_bf16 = qkv_linear.to(torch.bfloat16)
-                # (1, N, 3, H, Hd)
-                qkv = qkv_bf16.reshape(1, N, 3, self.num_heads, self.head_dim)
+                # (B, N, 3, H, Hd)
+                qkv = qkv_bf16.reshape(B, N, 3, self.num_heads, self.head_dim)
             else:
-                qkv = qkv_linear.reshape(1, N, 3, self.num_heads, self.head_dim)
-            
+                qkv = qkv_linear.reshape(B, N, 3, self.num_heads, self.head_dim)
+
             out = None
 
             if kv_cache is not None and _flash_attn_with_kvcache_available:
                 # KV cache path
-                q = qkv[:, :, 0]  # (1, N, H, Hd)
+                q = qkv[:, :, 0]  # (B, N, H, Hd)
                 k_new = qkv[:, :, 1]
                 v_new = qkv[:, :, 2]
                 k_cache = kv_cache.get("k_cache")
@@ -195,7 +197,7 @@ class Attention(nn.Module):
                     block_table=block_table,
                     softmax_scale=self.scale,
                     causal=causal,
-                )  # (1, N, H, Hd)
+                )  # (B, N, H, Hd)
             else:
                 # qkv packed path
                 out = flash_attn_qkvpacked_func(
@@ -203,30 +205,17 @@ class Attention(nn.Module):
                     dropout_p=0.0,
                     softmax_scale=self.scale,
                     causal=causal,
-                )# (1, N, H, Hd)
+                )  # (B, N, H, Hd)
             if orig_dtype not in (torch.bfloat16, torch.float16):
-                x_attn = out.to(orig_dtype).reshape(1, N, C)
+                x_attn = out.to(orig_dtype).reshape(B, N, C)
             else:
-                x_attn = out.reshape(1, N, C)
+                x_attn = out.reshape(B, N, C)
         else:
-            # Fallback to standard attention
-            # do not fallback
             raise Exception("Flash Attention is not available!")
-            # qkv = qkv_linear.reshape(1, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4).contiguous()
-            # q, v = qkv[0], qkv[2]  # (1, H, N, Hd)
-            # k = qkv[1]
-            # attn = (q @ k.transpose(-2, -1).contiguous()) * self.scale  # (1, H, N, N)
-            # if causal:
-            #     # Causal mask for sequence length N
-            #     causal_mask = torch.triu(torch.ones(N, N, device=attn.device, dtype=torch.bool), diagonal=1)
-            #     attn = attn.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
-            # attn = attn.softmax(dim=-1)
-            # attn = self.attn_drop(attn)
-            # x_attn = (attn @ v).transpose(1, 2).reshape(1, N, C).contiguous()
 
         x_proj = self.proj(x_attn)
         x_proj = self.proj_drop(x_proj)
-        return x_proj.squeeze(0)
+        return x_proj.squeeze(0) if squeeze else x_proj
 
 # TODO: 直接找一个现成的
 class Block(nn.Module):
@@ -244,18 +233,23 @@ class Block(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.norm1(x))
         x = x + self.mlp(self.norm2(x))
-        if torch.cuda.is_available():   
-            torch.cuda.empty_cache()
         return x
 
 
 class HybridBlock(nn.Module):
     """
-    Hybrid Block that combines:
-    1. Cross-residue and cross-frequency attention (full attention across all tokens)
-    2. Frequency-specific attention using SpectralDiTBlock (attention along frequency dimension)
-    
-    This allows learning both residue interactions and frequency dependencies separately.
+    Spatio-spectral hybrid block, matching the paper's
+    "Spatio-spectral Hybrid Planner" (Sec. 3.5). It alternates two attention
+    operations over the same tokens, factorized by axis:
+
+    1. Inter-residue spatial attention: attention ACROSS RESIDUES for each
+       frequency independently, capturing collective motions.
+    2. Intra-residue spectral attention: attention ALONG THE FREQUENCY AXIS
+       within each residue (RoPE), capturing phase correlations.
+
+    Both are O(N_r^2 * F + N_r * F^2), matching the complexity analysis in the
+    paper's appendix. Note the block deliberately does NOT do attention over the
+    flattened (N_r * F) token axis, which would be O(N_r^2 F^2).
     """
     def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 4.0, qkv_bias: bool = True,
                  norm_layer: nn.Module = nn.LayerNorm, proj_drop: float = 0.0, attn_drop: float = 0.0,
@@ -296,46 +290,55 @@ class HybridBlock(nn.Module):
             x: same shape as input
         """
         orig_shape = x.shape
-        
-        # 1. Cross-residue and cross-frequency attention (full attention)
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
-        
-        # 2. Frequency-specific attention using SpectralDiTBlock
+
+        # Normalise to (num_residues, seq_len, dim); the block is axis-factorized.
+        if x.dim() == 2:
+            if num_residues is None or seq_len is None:
+                raise ValueError("num_residues and seq_len must be provided when x is 2D")
+            x_reshaped = x.reshape(num_residues, seq_len, -1)
+        elif x.dim() == 3:
+            x_reshaped = x
+            num_residues, seq_len = x.shape[:2]
+        else:
+            raise ValueError(f"Unexpected input shape: {x.shape}")
+
+        dim = x_reshaped.shape[-1]
+
+        # 1. Inter-residue spatial attention: attend across residues, per frequency.
+        #    Batch the frequency axis so attention's sequence axis is exactly the
+        #    residue axis (cost O(F * N_r^2)), NOT the flattened (F*N_r) axis
+        #    (which would be O(F^2 * N_r^2)).
+        spatial_in = x_reshaped.permute(1, 0, 2)  # (F, N_r, D)
+        spatial_out = self.attn(self.norm1(spatial_in))
+        x_reshaped = x_reshaped + spatial_out.permute(1, 0, 2)
+
+        # MLP
+        x_reshaped = x_reshaped + self.mlp(self.norm2(x_reshaped))
+
+        # 2. Intra-residue spectral attention: attend along the frequency axis (RoPE).
         if self.use_spectral_attention:
-            # Reshape to (num_residues, seq_len, dim) for frequency attention
-            if x.dim() == 2:
-                # Flattened: (num_residues * seq_len, dim)
-                if num_residues is None or seq_len is None:
-                    raise ValueError("num_residues and seq_len must be provided when x is 2D")
-                x_reshaped = x.reshape(num_residues, seq_len, -1)
-            elif x.dim() == 3:
-                # Already (num_residues, seq_len, dim)
-                x_reshaped = x
-                num_residues, seq_len = x.shape[:2]
+            # SpectralDiTBlock's contract is 4D x with an optional leading batch
+            # dim: x (..., N_atom, seq_len, c_atom), and a per-N_atom condition
+            # c (..., N_atom, c_atom) that it unsqueeze(-2)'s to (..., N_atom, 1, c).
+            # Here the residue token axis maps to N_atom and the frequency axis
+            # to seq_len, so the condition must be per-residue 2D — passing the
+            # full (N_r, F, D) as the condition makes the unsqueezed 3*hidden
+            # chunk collide with the frequency axis.
+            if condition is None:
+                # Self-conditioning: aggregate along the frequency axis.
+                c2 = x_reshaped.mean(dim=1)
+            elif condition.dim() == 3:
+                c2 = condition.mean(dim=1)
             else:
-                raise ValueError(f"Unexpected input shape: {x.shape}")
-            
-            # Prepare condition for SpectralDiTBlock
-            if condition is not None:
-                # Use provided condition
-                c = condition
-            else:
-                # Use x itself as condition (self-conditioning)
-                c = x_reshaped
-            
-            # Apply SpectralDiTBlock for frequency-specific attention
-            # SpectralDiTBlock applies attention along seq_len (frequency) dimension
-            x_reshaped = self.spectral_dit_block(x_reshaped, c)
-            
-            # Reshape back to original format
-            if len(orig_shape) == 2:
-                x = x_reshaped.reshape(num_residues * seq_len, -1)
-            else:
-                x = x_reshaped
-        
-        if torch.cuda.is_available():   
-            torch.cuda.empty_cache()
+                c2 = condition
+            x_reshaped = self.spectral_dit_block(x_reshaped[None], c2).squeeze(0)
+
+        # Restore the caller's layout.
+        if len(orig_shape) == 2:
+            x = x_reshaped.reshape(num_residues * seq_len, -1)
+        else:
+            x = x_reshaped
+
         return x
 
 
@@ -351,6 +354,8 @@ class IPAModule(nn.Module):
                  eps:float,
                  num_ipa_layers:int,
                  dropout_rate:float):
+        # IPA math adapted from OpenFold (Algorithm 22); see
+        # src/openfold_local/model/structure_module.py for the vendored source.
         super().__init__()
         self.c_s = c_s
         self.c_z = c_z
@@ -410,13 +415,6 @@ class IPAModule(nn.Module):
         return s_s
 
 
-def mask_by_order(mask_len, order, bsz, seq_len):
-    """Generate mask based on order and mask length"""
-    masking = torch.zeros(bsz, seq_len, device=order.device)
-    masking = torch.scatter(masking, dim=-1, index=order[:, :mask_len.long()], 
-                           src=torch.ones(bsz, seq_len, device=order.device)).bool()
-    return masking
-
 
 class ProteinSpectrumFAR(nn.Module):
     """
@@ -471,7 +469,7 @@ class ProteinSpectrumFAR(nn.Module):
                  # Diffusion loss specifics
                  diffloss_d=3,
                  diffloss_w=1024,
-                 num_sampling_steps='100',
+                 num_sampling_steps='50',
                  diffusion_batch_mul=4,
                  # Diffusion core knobs
                  learn_sigma=False,
@@ -731,9 +729,21 @@ class ProteinSpectrumFAR(nn.Module):
 
         # Loss weight: 动态计算，不再需要固定的buffer
         # 在forward时根据实际seq_len计算
-        
+
+        # Snapshot the diffusion head's own initialisation (adaLN-Zero
+        # modulation with a zero-initialised `final_layer.linear`) BEFORE running
+        # the blanket init below. `self.apply()` is recursive, so without this
+        # the xavier re-init overwrites `final_layer.linear` and the denoiser
+        # starts from a large random output instead of 0 -- which makes
+        # `pred_xstart` (the training target of SpectrumChunkLoss) huge from
+        # step 0. Set first so `initialize_weights()` can never see it unset.
+        self._diffusion_head_init = {
+            name: param.detach().clone()
+            for name, param in self.spectrum_diffloss.named_parameters()
+        }
+
         self.initialize_weights()
-    
+
     def _get_cached_freqs(self, cache_dict, dim: int, total_len: int, device):
         """Get cached RoPE freqs_cis tensor or compute and store it.
         Cache key is (dim, total_len, str(device)).
@@ -769,10 +779,23 @@ class ProteinSpectrumFAR(nn.Module):
         # torch.nn.init.normal_(self.fake_condition_residue, std=.02)
         if self.mask:
             torch.nn.init.normal_(self.mask_token, std=.02)
-        
+
         # Initialize nn.Linear and nn.LayerNorm
         self.apply(self._init_weights)
-    
+
+        # `self.apply()` recurses into `self.spectrum_diffloss` too, which would
+        # discard the diffusion head's dedicated initialisation (see __init__).
+        if getattr(self, "_diffusion_head_init", None) is not None:
+            self._restore_diffusion_head_init()
+
+    def _restore_diffusion_head_init(self):
+        """Copy the snapshot taken in __init__ back into the diffusion head."""
+        with torch.no_grad():
+            for name, param in self.spectrum_diffloss.named_parameters():
+                saved = self._diffusion_head_init.get(name)
+                if saved is not None and saved.shape == param.shape:
+                    param.copy_(saved)
+
     def get_freq_loss_weight(self, seq_len, device):
         """
         Dynamically compute frequency-dependent loss weight
@@ -893,28 +916,27 @@ class ProteinSpectrumFAR(nn.Module):
         masked_spectrum = torch.zeros_like(spectrum_positive)
 
         if int(stage) > 0:
-            # 直接对 spectrum_positive 做二维插值（频率轴 + xyz 轴），避免多次 reshape
+            # 沿频率轴做 1D 线性插值（Interp_freq，见论文 Eq.(4)）：
+            # 对每个 residue 和每个 token 通道独立插值，绝不跨 real/imag 通道混合。
             # 输入: spectrum_positive (..., num_residues, seq_len, spectrum_dim)
             # 截取前 stage 个频率分量（在 seq_len 维度上）
             partial_spectrum = spectrum_positive[..., :stage, :]  # (..., num_residues, stage, spectrum_dim)
-            
-            # 需要 F.interpolate 的输入为 (N, C, H, W)
-            # 这里 "C" 作为1，H: freq, W: xyz（或 dim）
-            # 先转为 (..., num_residues, 1, stage, spectrum_dim)
-            interp_input = partial_spectrum.unsqueeze(-3)  # (..., num_residues, 1, stage, spectrum_dim)
-            # 合并前面的 batch/num_residues: (N, 1, stage, spectrum_dim)
-            orig_shape = interp_input.shape
-            interp_input = interp_input.reshape(-1, 1, stage, self.spectrum_dim)
-            # 二维插值到 (seq_len, spectrum_dim)
+
+            # 合并前面的 batch/num_residues。
+            # 注意：F.interpolate 对 3D 输入只插值**最后一维**，所以必须先把
+            # 频率轴挪到最后一维，否则会把 token 通道轴拉伸（曾经踩过这个坑）。
+            orig_shape = partial_spectrum.shape
+            last_dim = partial_spectrum.shape[-1]
+            # (M, stage, last_dim) -> (M, last_dim, stage)
+            interp_input = partial_spectrum.reshape(-1, stage, last_dim).transpose(-1, -2)
             interpolated = F.interpolate(
                 interp_input,
-                size=(seq_len, self.spectrum_dim),
-                mode='bilinear',
-                align_corners=False
-            )
-            # 还原维度 (..., num_residues, seq_len, spectrum_dim)
-            interpolated = interpolated.reshape(*orig_shape[:-3], seq_len, self.spectrum_dim)
-            interpolated = interpolated.squeeze(-3)
+                size=seq_len,
+                mode='linear',
+                align_corners=False,
+            )  # (M, last_dim, seq_len)
+            # 还原维度 (..., num_residues, seq_len, dim)
+            interpolated = interpolated.transpose(-1, -2).reshape(*orig_shape[:-2], seq_len, last_dim)
             masked_spectrum = interpolated
         
         base_orders = torch.arange(seq_len, device=device, dtype=torch.long)
@@ -943,41 +965,28 @@ class ProteinSpectrumFAR(nn.Module):
     #     orders = torch.tensor(np.array(orders), dtype=torch.long, device=device)
     #     return orders
 
-    def sample_orders(self, seq_len, device):
-        """Generate a random generation order (1D) for spectrum positions"""
-        return torch.randperm(seq_len, device=device, dtype=torch.long)
+    def sample_orders(self, seq_len, device, order_type: str = "linear"):
+        """Generation order (1D) over spectrum positions.
 
-    def random_masking(self, x, orders, stage_index, seq_len):
+        `linear` is the identity permutation over frequency bins; `random`
+        shuffles it. It is consumed by `sample_mask`, which keeps
+        `orders[:mask_len]` masked and therefore reveals the *complement* of
+        that prefix at each step.
+
+        `linear` is what the reference implementation uses for every sampling
+        entry point, so it is the default here too. Note the resulting reveal
+        direction in `sample_mask` runs high-index-first, which is the opposite
+        of the low-to-high order the paper describes for generation — see
+        `sample_nomask`, whose `freq_schedule` does grow low-to-high. Kept as
+        `linear` to match the reference rather than silently inverting the
+        schedule.
         """
-        Generate token mask for training (no batch version)
-        Args:
-            x: (num_residues, seq_len, embed_dim)
-            orders: (seq_len,) random order
-            stage_index: int or float, current stage
-            seq_len: sequence length
-        Returns:
-            mask: (num_residues, seq_len) boolean mask (True = masked)
-        """
-        num_residues, _, embed_dim = x.shape
-        device = x.device
+        if order_type == "linear":
+            return torch.arange(seq_len, device=device, dtype=torch.long)
+        if order_type == "random":
+            return torch.randperm(seq_len, device=device, dtype=torch.long)
+        raise ValueError(f"Unsupported order_type={order_type!r}, expected 'linear' or 'random'")
 
-        # Calculate mask ratio based on stage
-        mask_ratio = 1.0 - float(stage_index) / seq_len
-
-        # Add randomness
-        mask_ratio = mask_ratio + np.random.randn() * 0.1
-        mask_ratio = np.clip(mask_ratio, 0.0, 1.0)
-
-        # Generate mask for spectrum (no batch)
-        mask = torch.zeros(num_residues, seq_len, device=device)
-
-        num_masked = int(np.ceil(seq_len * mask_ratio))
-        # Mask according to random order
-        mask_indices = orders[:num_masked]
-        mask[:, mask_indices] = 1.0
-
-        return mask.bool()
-        
 
     def forward_encoder(self, 
                         spectrum_tokens, 
@@ -1422,9 +1431,6 @@ class ProteinSpectrumFAR(nn.Module):
         
         # Original training mode: random stage sampling
         # Progressive masking
-        masked_tokens, stage_index = self.progressive_masking(spectrum_tokens, num_residues, seq_len)
-
-        # Progressive masking
         # Note: spectrum_tokens should be spectrum_positive here
         masked_tokens, mask, stage_index = self.progressive_masking(spectrum_tokens)
 
@@ -1814,8 +1820,8 @@ class ProteinSpectrumFAR(nn.Module):
         tokens = torch.zeros(num_residues, seq_len, self.token_embed_dim, device=device)
         cur_tokens = torch.zeros_like(tokens)
         
-        # Generation orders (random shuffle)
-        orders = self.sample_orders(seq_len, device)
+        # Generation order: low frequency -> high frequency (paper Sec. 3.6)
+        orders = self.sample_orders(seq_len, device, order_type="linear")
         
         # Iterative generation
         indices = list(range(num_iter))
@@ -1963,7 +1969,7 @@ def protein_spectrum_far_base(**kwargs):
         'mlp_ratio': 4,
         'norm_layer': partial(nn.LayerNorm, eps=1e-6),
         # DIFFLOSS
-        'num_sampling_steps': '100',
+        'num_sampling_steps': '50',
         'diffusion_batch_mul': 4,
         'diffloss_d': 3,
         'diffloss_w': 1024,
@@ -1994,7 +2000,7 @@ def protein_spectrum_far_large(**kwargs):
         'buffer_size': 64,
         'mlp_ratio': 4,
         'norm_layer': partial(nn.LayerNorm, eps=1e-6),
-        'num_sampling_steps': '100',
+        'num_sampling_steps': '50',
         'diffusion_batch_mul': 4,
         'diffloss_d': 3,
         'diffloss_w': 1024,
@@ -2026,7 +2032,7 @@ def protein_spectrum_far_huge(**kwargs):
         'mlp_ratio': 4,
         'norm_layer': partial(nn.LayerNorm, eps=1e-6),
         # diffloss
-        'num_sampling_steps': '100',
+        'num_sampling_steps': '50',
         'diffusion_batch_mul': 4,
         'diffloss_d': 3,
         'diffloss_w': 1024,

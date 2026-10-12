@@ -1,2 +1,26 @@
 dataset/
+dataset
 logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Compiled extensions / build leftovers
+*.so
+*.o
+.ninja_deps
+.ninja_log
+build/
+
+# macOS
+.DS_Store
+._*
+
+# Runs / outputs
+runs/
+runs_ray_tune/
+wandb/
+lightning_logs/

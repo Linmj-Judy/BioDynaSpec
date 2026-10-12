@@ -16,7 +16,12 @@ except Exception:
     HAS_GEMMI = False
 
 # ===================== User-configurable switches =====================
+# 只提取 Cα 原子（BioDynaSpec 是 residue-level / Cα-only 建模，见论文 Sec. 3.1）。
+# 设为 False 才会退回按 IGNORE_WATER / IGNORE_IONS 选择多原子。
+USE_CA_ONLY = True
+
 # 是否在保存时忽略水分子（使用 MDAnalysis 选择字符串 "water"）
+# 仅在 USE_CA_ONLY = False 时生效。
 IGNORE_WATER = True
 
 # 是否在保存时忽略常见离子
@@ -51,7 +56,14 @@ suffixes = ["R1", "R2", "R3"]
 # ======================================================================
 
 def _build_selection_string():
-    """根据开关构建选择字符串。"""
+    """根据开关构建选择字符串。
+
+    BioDynaSpec models residue-level dynamics on Cα coordinates (paper
+    Sec. 3.1, Eq. 1), so the default selection is CA-only, matching
+    ``replace_positions_full_fft_atlas.py --atom_selection "name CA"``.
+    """
+    if USE_CA_ONLY:
+        return "name CA"
     if not IGNORE_WATER and not IGNORE_IONS:
         return None  # 选择全部原子
     sel = None

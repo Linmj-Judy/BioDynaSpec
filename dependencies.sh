@@ -1,12 +1,68 @@
 #!/bin/bash
+# ============================================================================
+# BioDynaSpec environment setup
+# ============================================================================
+# Creates a conda env named "torch" (CUDA 12.4 / Python 3.11) with everything
+# needed to run scripts/pretrain.sh and scripts/inference.sh.
+#
+# Usage:
+#   bash dependencies.sh
+#   conda activate torch
+#
+# After this, run training with the env on PATH (scripts/pretrain.sh calls a
+# bare `python`, so the env must be active):
+#   conda activate torch
+#   bash scripts/pretrain.sh --config configs/trainer_BioDynaSpec.yaml
+#
+# NOTE ON THE ENV NAME: this used to be "A800_dl_cu124", a machine-specific
+# name that did not match what the code/README assumed. It is now "torch".
+# The pinned versions below mirror requirements.txt, which was read out of a
+# known-working env (Python 3.11.15, torch 2.6.0+cu124).
+# ============================================================================
 set -euo pipefail
-ENV_NAME="A800_dl_cu124"
+ENV_NAME="torch"
 conda_channels=(
   "https://mirrors.ustc.edu.cn/anaconda/pkgs/main"
   "https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge"
   "nvidia/label/cuda-12.4.1"
   "defaults"
 )
+
+# ============================================================================
+# Locate conda explicitly.
+# ============================================================================
+# `bash dependencies.sh` starts a NON-interactive shell, which does NOT source
+# ~/.bashrc — so the conda-init block there never runs and a bare `conda` may
+# not be on PATH. Resolve it here, from CONDA_EXE / known install roots, and
+# fail with an actionable message instead of a bare "command not found".
+if ! command -v conda >/dev/null 2>&1; then
+  for _c in \
+      "${CONDA_EXE:-}" \
+      "$HOME/miniconda3/bin/conda" \
+      "$HOME/anaconda3/bin/conda" \
+      "/data/L202500336/miniconda3/bin/conda" \
+      "/opt/conda/bin/conda"
+  do
+    if [ -n "${_c}" ] && [ -x "${_c}" ]; then
+      export PATH="$(dirname "${_c}"):${PATH}"
+      break
+    fi
+  done
+fi
+if ! command -v conda >/dev/null 2>&1; then
+  echo "ERROR: conda not found on PATH."
+  echo "  This script is run non-interactively, so ~/.bashrc (and any conda"
+  echo "  init block in it) is NOT sourced."
+  echo "  Fix by exporting PATH first, e.g.:"
+  echo "      export PATH=/data/L202500336/miniconda3/bin:\$PATH   # adjust to your install"
+  echo "      bash dependencies.sh"
+  exit 1
+fi
+CONDA_BIN="$(command -v conda)"
+CONDA_BASE="$(dirname "$(dirname "${CONDA_BIN}")")"
+echo "Using conda: ${CONDA_BIN}"
+echo "Conda base : ${CONDA_BASE}"
+echo "Target env : ${ENV_NAME}  (will live at ${CONDA_BASE}/envs/${ENV_NAME})"
 
 # ==============Step1: 下载gcc13.3.0==============
 export GCC_ROOT=$HOME/software/gcc-13.3.0 # 选择一个你有权限的安装路径
@@ -64,54 +120,31 @@ conda install -n "${ENV_NAME}" -y \
   cuda-nvprof=12.9.19 cuda-cupti=12.9.19 \
   cuda-nvcc=12.4.131 cuda-nvrtc=12.9.41 \
   libcublas=12.9.0.13 libcudnn=9.1.0.70
-# 5. 通过 pip 安装剩余 python 包（将 requirements.txt 拆分为核心/额外两组）
-pip install --no-cache-dir \
-  absl-py==2.3.1 accelerate==1.5.2 \
-  datasets==3.6.0 deepspeed==0.16.5 \
-  jupyterlab==4.4.7 \
-  fastapi==0.120.4 \
-  tensorflow-cpu==2.19.0 \
-  torchmetrics==1.7.1 \
-  safetensors==0.5.3 \
-  wandb==0.19.9 \
-  pymatgen==2024.2.23 \
-conda install -c conda-forge rdkit
+# ==============Step3: Python 依赖（与 requirements.txt 对齐）==============
+# 这些 pin 取自一个已验证可用的环境（Python 3.11.15 + torch 2.6.0+cu124），
+# 不是估计值。torch 必须先从 CUDA 索引装，否则会拿到 CPU 版。
+conda run -n "${ENV_NAME}" pip install --no-cache-dir \
+  torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 
-CUDA_INSTALL_PATH=/share/software/cuda/local/cuda-12.4
-export CUDACXX=${CUDA_INSTALL_PATH}/bin/nvcc
-git clone https://github.com/NVIDIA/cutlass.git
-cd cutlass
-mkdir build && cd build
-cmake .. -DCUTLASS_NVCC_ARCHS=80               # compiles for NVIDIA's Ampere Architecture
+conda run -n "${ENV_NAME}" pip install --no-cache-dir -r requirements.txt
 
-# pip install "git+https://github.com/MDAnalysis/mdanalysis@develop"
-pip install --upgrade MDAnalysis
+# ==============Step4: flash-attn（可选，但推荐）==============
+# 需要 CUDA 工具链（见 Step1 的 gcc 与下面的 CUDA 说明）。编译较慢。
+# 若编译失败，BioDynaSpec 会优雅降级为普通 attention（见
+# src/protein_spectrum_far.py 的 try/except），不影响训练正确性。
+conda run -n "${ENV_NAME}" pip install --no-build-isolation flash-attn==2.7.2.post1 || \
+  echo "[warn] flash-attn 安装失败，将回退到标准 attention"
 
-pip install git+https://github.com/TimoLassmann/kalign.git
-
-# cd torchdrug
-# # pip install -r requirements.txt
-# python setup.py install
-py_version=$(python -c "import torch;print(torch.__version__.split('+')[0])")
-cuda_version=$(nvcc --version | grep release | awk '{print $6}' | awk -F '.' '{print $1"."$2}')
-pip install torch-scatter -f https://data.pyg.org/whl/torch-${py_version}+cu${cuda_version}.html
-pip install torch-sparse -f https://data.pyg.org/whl/torch-${py_version}+cu${cuda_version}.html
-pip install torch-cluster -f https://data.pyg.org/whl/torch-${py_version}+cu${cuda_version}.html
-
-pip install deepspeed==0.16.5
-pip install pytorch_lightning==2.5.1.post0
-pip install ray==2.51.1
-pip install "ray[tune]"
-pip install ml_collections==1.1.0
-pip install rdkit==2025.3.6
-pip install optree==0.15.0
-pip install biotite==1.2.0
-pip install -U 'wandb>=0.12.10'
-pip install tokenizers==0.21.1
-pip install transformers==4.51.3
-pip install fair-esm
-pip install easydict
-pip install lmdb
-pip install torchdrug
-pip install dm-tree
-pip install modelcif
+# ==============说明==============
+# * 不需要 torchdrug：它原先只是 src/data/dataset_atlas.py 里一条死代码路径
+#   （collate_fn / data.PackedGraph）的依赖，DataModule 实际用的是
+#   collate_fn_single。该 import 已移除。
+# * 不需要 openfold：仓库自带 src/openfold_local/，根目录的 openfold.py 是
+#   fair-esm 的 esmfold 需要顶层 openfold 包时用的 shim（详见 requirements.txt
+#   的 notes）。请勿 pip install openfold，会和 shim 冲突。
+# * gemmi 可选：只用于 extract_frames 的 CIF 导出路径，训练不需要。
+#
+# 验证安装：
+#   conda activate ${ENV_NAME}
+#   python -c "import torch, pytorch_lightning; print(torch.__version__)"
+#   python check_imports.py --chain     # 应输出 "BROKEN imports ... 0"

@@ -15,6 +15,7 @@
 import importlib
 import math
 import os
+import warnings
 from typing import Callable, List, Optional, Tuple
 
 import numpy as np
@@ -542,7 +543,20 @@ class Attention(nn.Module):
                     "If use_deepspeed_evo_attention is True, you may only "
                     "provide up to two bias terms"
                 )
-            o = _deepspeed_evo_attn(q, k, v, biases)
+            try:
+                o = _deepspeed_evo_attn(q, k, v, biases)
+            except Exception as e:
+                # The DS4Sci EvoformerAttention kernel needs a JIT-compiled
+                # extension (and, on some toolchains, $CUTLASS_PATH). When that
+                # is unavailable the whole model would otherwise fail to train
+                # for a pure speed optimisation, so fall back to the stock
+                # PyTorch attention, which produces the same result.
+                warnings.warn(
+                    "DeepSpeed EvoformerAttention kernel unavailable "
+                    f"({type(e).__name__}: {e}); falling back to the stock "
+                    "PyTorch attention implementation."
+                )
+                o = _attention(q, k, v, biases)
         elif use_lma:
             biases = [
                 b.expand(b.shape[:-2] + (q_x.shape[-2],) + (kv_x.shape[-2],))
