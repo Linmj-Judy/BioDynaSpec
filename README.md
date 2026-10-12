@@ -618,9 +618,9 @@ bash scripts/inference.sh \
 If you find this code useful in your research, please cite:
 
 ```bibtex
-@inproceedings{biodynaspec2026,
+@inproceedings{lin2026biodynaspec,
   title={BioDynaSpec: Harmonic-Guided Spatio-Spectral Autoregressive Diffusion for Protein Dynamics Generation},
-  author={Anonymous},
+  author={Lin, Mujie and Liu, Yutian and Guo, Yudi and Hou, Yanzhen and Tao, Yiheng and Zheng, Ruochong and Cheng, Kaiwen and Shan, Xin and Mao, Youdong and Chen, Jie},
   booktitle={International Conference on Machine Learning (ICML)},
   year={2026}
 }
